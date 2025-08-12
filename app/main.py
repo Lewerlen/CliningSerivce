@@ -1,9 +1,9 @@
-# Файл: main.py
+
 import asyncio
 import logging
 import os
 from typing import Callable, Dict, Any, Awaitable
-
+from aiogram.client.default import DefaultBotProperties
 from aiogram import Bot, Dispatcher, BaseMiddleware
 from aiogram.types import TelegramObject
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -52,9 +52,9 @@ async def main():
     # -------------------------------------
 
     # Инициализируем ботов и диспетчеры для каждого
-    client_bot = Bot(token=config.bots.client_bot_token, parse_mode="HTML")
-    executor_bot = Bot(token=config.bots.executor_bot_token, parse_mode="HTML")
-    admin_bot = Bot(token=config.bots.admin_bot_token, parse_mode="HTML")
+    client_bot = Bot(token=config.bots.client_bot_token, default=DefaultBotProperties(parse_mode="HTML"))
+    executor_bot = Bot(token=config.bots.executor_bot_token, default=DefaultBotProperties(parse_mode="HTML"))
+    admin_bot = Bot(token=config.bots.admin_bot_token, default=DefaultBotProperties(parse_mode="HTML"))
 
     client_dp = Dispatcher()
     executor_dp = Dispatcher()

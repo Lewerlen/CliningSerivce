@@ -2,7 +2,6 @@ from sqlalchemy import (Column, Integer, String, BigInteger,
                         Float, DateTime, Enum)
 from sqlalchemy.orm import declarative_base
 import datetime
-from datetime import timezone
 import enum
 
 Base = declarative_base()
@@ -26,7 +25,7 @@ class User(Base):
     phone = Column(String) # [cite: 283]
     rating = Column(Float, default=0.0) # [cite: 283]
     status = Column(Enum(UserStatus), default=UserStatus.active, nullable=False) # [cite: 283]
-    created_at = Column(DateTime, default=lambda: datetime.datetime.now(timezone.utc)) #
+    created_at = Column(DateTime, default=datetime.datetime.now) #
 
 class ServiceType(enum.Enum):
     base = "base"
