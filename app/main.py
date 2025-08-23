@@ -1,20 +1,18 @@
-
 import asyncio
 import logging
 import os
 from typing import Callable, Dict, Any, Awaitable
-from aiogram.client.default import DefaultBotProperties
+
 from aiogram import Bot, Dispatcher, BaseMiddleware
+from aiogram.client.default import DefaultBotProperties
 from aiogram.types import TelegramObject
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 
-# Импортируем созданный нами конфигуратор и обработчики
 from app.config import load_config
 from app.handlers import admin, client, executor
 from app.database.models import Base
 
-# --- КЛАСС MIDDLEWARE ДЛЯ СЕССИЙ БД (ВМЕСТО ОТДЕЛЬНОГО ФАЙЛА) ---
 class DbSessionMiddleware(BaseMiddleware):
     def __init__(self, session_pool: sessionmaker):
         self.session_pool = session_pool
@@ -28,30 +26,48 @@ class DbSessionMiddleware(BaseMiddleware):
         async with self.session_pool() as session:
             data["session"] = session
             return await handler(event, data)
-# -------------------------------------------------------------
 
-# Настраиваем логирование для отладки
-logging.basicConfig(level=logging.INFO)
 
+# --- НОВЫЙ БЛОК ДЛЯ УНИВЕРСАЛЬНОГО ЛОГИРОВАНИЯ ---
+
+class ContextFilter(logging.Filter):
+    """
+    Это фильтр, который добавляет в логи данные о пользователе,
+    если они есть, или значения по умолчанию, если их нет.
+    """
+
+    def filter(self, record):
+        record.username = getattr(record, 'username', 'System')
+        record.user_id = getattr(record, 'user_id', 'System')
+        return True
+
+
+# Настраиваем основное логирование без defaults
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(name)s - @%(username)s (%(user_id)s) - %(message)s"
+)
+
+# Добавляем наш фильтр ко всем логгерам
+for handler in logging.root.handlers:
+    handler.addFilter(ContextFilter())
+
+# --- КОНЕЦ НОВОГО БЛОКА ---
+
+logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 
 async def main():
-    # Загружаем конфигурацию с токенами
     config = load_config()
-
-    # ---- БЛОК РАБОТЫ С БАЗОЙ ДАННЫХ ----
     DATABASE_URL = os.getenv("DATABASE_URL")
     if not DATABASE_URL:
         logging.error("Не найдена переменная окружения DATABASE_URL")
         return
 
-    engine = create_async_engine(DATABASE_URL, echo=True)
+    engine = create_async_engine(DATABASE_URL, echo=False)
     session_maker = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    # -------------------------------------
 
-    # Инициализируем ботов и диспетчеры для каждого
     client_bot = Bot(token=config.bots.client_bot_token, default=DefaultBotProperties(parse_mode="HTML"))
     executor_bot = Bot(token=config.bots.executor_bot_token, default=DefaultBotProperties(parse_mode="HTML"))
     admin_bot = Bot(token=config.bots.admin_bot_token, default=DefaultBotProperties(parse_mode="HTML"))
@@ -60,17 +76,22 @@ async def main():
     executor_dp = Dispatcher()
     admin_dp = Dispatcher()
 
-    # Регистрируем Middleware для сессий в каждый диспетчер
     client_dp.update.middleware(DbSessionMiddleware(session_pool=session_maker))
     executor_dp.update.middleware(DbSessionMiddleware(session_pool=session_maker))
     admin_dp.update.middleware(DbSessionMiddleware(session_pool=session_maker))
 
-    # Регистрируем "роутеры" с обработчиками для каждого бота
+    bots = {"client": client_bot, "executor": executor_bot, "admin": admin_bot}
+    client_dp["bots"] = bots
+    executor_dp["bots"] = bots
+    admin_dp["bots"] = bots
+    client_dp["config"] = config
+    executor_dp["config"] = config
+    admin_dp["config"] = config
+
     client_dp.include_router(client.router)
     executor_dp.include_router(executor.router)
     admin_dp.include_router(admin.router)
 
-    # Запускаем всех ботов одновременно
     try:
         await asyncio.gather(
             client_dp.start_polling(client_bot),
@@ -82,7 +103,6 @@ async def main():
         await executor_bot.session.close()
         await admin_bot.session.close()
         await engine.dispose()
-
 
 if __name__ == "__main__":
     try:

@@ -1,6 +1,6 @@
 from sqlalchemy import (Column, Integer, String, BigInteger,
-                        Float, DateTime, Enum)
-from sqlalchemy.orm import declarative_base
+                        Float, DateTime, Enum, ForeignKey)
+from sqlalchemy.orm import declarative_base, relationship
 import datetime
 import enum
 
@@ -38,3 +38,56 @@ class Service(Base):
     name = Column(String, unique=True, nullable=False) # [cite: 289]
     type = Column(Enum(ServiceType), nullable=False) # [cite: 289]
     price = Column(Float, nullable=False) # [cite: 289]
+
+class OrderStatus(enum.Enum):
+    new = "new"
+    accepted = "accepted"
+    in_progress = "in_progress"
+    completed = "completed"
+    cancelled = "cancelled"
+
+
+class Order(Base):
+    __tablename__ = 'orders'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    client_tg_id = Column(BigInteger, nullable=False)
+    status = Column(Enum(OrderStatus), default=OrderStatus.new, nullable=False)
+
+    # Детали заказа
+    cleaning_type = Column(String)
+    room_count = Column(String)
+    bathroom_count = Column(String)
+
+    # Адрес
+    address_text = Column(String)
+    address_lat = Column(Float)
+    address_lon = Column(Float)
+
+    # Дата и время
+    selected_date = Column(String)
+    selected_time = Column(String)
+
+    # Контакты для заказа
+    order_name = Column(String)
+    order_phone = Column(String)
+
+    # Фото и цена
+    photo_file_id = Column(String)
+    total_price = Column(Float)
+
+    created_at = Column(DateTime, default=datetime.datetime.now)
+
+    # Связь с таблицей order_items
+    items = relationship("OrderItem", back_populates="order")
+
+
+class OrderItem(Base):
+    __tablename__ = 'order_items'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    order_id = Column(Integer, ForeignKey('orders.id'), nullable=False)
+    service_key = Column(String, nullable=False)  # Например, 'win' или 'sofa'
+
+    # Связь с таблицей orders
+    order = relationship("Order", back_populates="items")

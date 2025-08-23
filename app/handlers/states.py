@@ -1,8 +1,16 @@
 from aiogram.fsm.state import State, StatesGroup
 
-class RegistrationStates(StatesGroup):
-    waiting_for_phone = State()
-
 class OrderStates(StatesGroup):
     choosing_cleaning_type = State()
-    # в будущем здесь будут другие состояния: выбор комнат, санузлов и т.д.
+    choosing_room_count = State()
+    choosing_bathroom_count = State()
+    choosing_additional_services = State()
+    entering_address = State()
+    confirming_address = State()
+    choosing_date = State()
+    choosing_time = State()
+    waiting_for_photo = State()
+    entering_order_name = State()
+    entering_order_phone = State()
+    confirming_order = State()
+    choosing_payment_method = State()
