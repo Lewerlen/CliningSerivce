@@ -1,5 +1,5 @@
 from sqlalchemy import (Column, Integer, String, BigInteger,
-                        Float, DateTime, Enum, ForeignKey)
+                        Float, DateTime, Enum, ForeignKey, Boolean)
 from sqlalchemy.orm import declarative_base, relationship
 import datetime
 import enum
@@ -25,7 +25,7 @@ class User(Base):
     phone = Column(String) # [cite: 283]
     rating = Column(Float, default=0.0) # [cite: 283]
     status = Column(Enum(UserStatus), default=UserStatus.active, nullable=False) # [cite: 283]
-    created_at = Column(DateTime, default=datetime.datetime.now) #
+    created_at = Column(DateTime, default=datetime.datetime.now)
 
 class ServiceType(enum.Enum):
     base = "base"
@@ -77,6 +77,10 @@ class Order(Base):
     total_price = Column(Float)
 
     created_at = Column(DateTime, default=datetime.datetime.now)
+
+    # Поля для отслеживания отправки напоминаний
+    reminder_24h_sent = Column(Boolean, default=False, nullable=False)
+    reminder_2h_sent = Column(Boolean, default=False, nullable=False)
 
     # Связь с таблицей order_items
     items = relationship("OrderItem", back_populates="order")

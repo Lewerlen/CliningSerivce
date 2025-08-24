@@ -1,14 +1,14 @@
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.utils.keyboard import InlineKeyboardBuilder  # <--- НОВЫЙ ИМПОРТ
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 import calendar
 from datetime import datetime
+from app.common.texts import STATUS_MAPPING
 
 # --- НОВЫЙ БЛОК: ВСЕ ДЛЯ КАЛЕНДАРЯ ---
 RUSSIAN_MONTHS = [
     "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
     "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"
 ]
-
 
 async def create_calendar(year: int, month: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -62,6 +62,60 @@ def get_main_menu_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="📞 Поддержка")],
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+
+def get_edit_order_keyboard() -> InlineKeyboardMarkup:
+    """Возвращает клавиатуру для выбора действия при редактировании заказа."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Изменить дату и время", callback_data="edit_datetime")
+    builder.button(text="Изменить доп. услуги", callback_data="edit_services")
+    builder.button(text="Изменить адрес", callback_data="edit_address")
+    builder.button(text="Изменить кол-во комнат/санузлов", callback_data="edit_rooms")
+    builder.button(text="⬅️ Назад к заказам", callback_data="back_to_my_orders")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_active_orders_keyboard(orders: list) -> InlineKeyboardMarkup:
+    """Создает клавиатуру со списком активных заказов и кнопкой архива."""
+    builder = InlineKeyboardBuilder()
+    for order in orders:
+        text = f"Заказ №{order.id} от {order.created_at.strftime('%d.%m.%Y')} - {order.total_price} ₽"
+        builder.button(text=text, callback_data=f"view_order:{order.id}")
+
+    builder.button(text="🗂 Архив заказов", callback_data="view_archive")
+    builder.adjust(1)  # Все кнопки в один столбец
+    return builder.as_markup()
+
+def get_view_order_keyboard(order_id: int, can_be_edited: bool) -> InlineKeyboardMarkup:
+    """Создает клавиатуру для просмотра активного заказа."""
+    builder = InlineKeyboardBuilder()
+    if can_be_edited:
+        builder.button(text="✏️ Изменить заказ", callback_data=f"edit_order:{order_id}")
+    builder.button(text="❌ Отменить заказ", callback_data=f"cancel_order:{order_id}")
+    builder.button(text="⬅️ Назад к заказам", callback_data="back_to_orders_list")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_archive_orders_keyboard(orders: list) -> InlineKeyboardMarkup:
+    """Создает клавиатуру со списком архивных заказов."""
+    builder = InlineKeyboardBuilder()
+    for order in orders:
+        status_text = STATUS_MAPPING.get(order.status, order.status.value)
+        text = f"Заказ №{order.id} от {order.created_at.strftime('%d.%m.%Y')} - {status_text}"
+        builder.button(text=text, callback_data=f"view_archive_order:{order.id}")
+
+    builder.button(text="⬅️ Назад к активным заказам", callback_data="back_to_orders_list")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_view_archive_order_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    """Создает клавиатуру для просмотра архивного заказа."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔄 Заказать снова", callback_data=f"repeat_order:{order_id}")
+    builder.button(text="⬅️ Назад к архиву", callback_data="view_archive")
+    builder.adjust(1)
+    return builder.as_markup()
 
 def get_cleaning_type_keyboard() -> ReplyKeyboardMarkup:
     """Возвращает клавиатуру для выбора типа уборки."""
@@ -161,14 +215,16 @@ def get_date_keyboard() -> ReplyKeyboardMarkup:
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
-def get_time_keyboard() -> ReplyKeyboardMarkup:
-    """Возвращает клавиатуру для выбора времени."""
-    buttons = [
-        [KeyboardButton(text="9:00 - 12:00"), KeyboardButton(text="12:00 - 15:00")],
-        [KeyboardButton(text="15:00 - 18:00"), KeyboardButton(text="18:00 - 21:00")],
-        [KeyboardButton(text="⬅️ Назад к выбору даты")]
-    ]
-    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+def get_time_keyboard(available_slots: list) -> ReplyKeyboardMarkup:
+    """Возвращает клавиатуру для выбора времени из доступных слотов."""
+    builder = ReplyKeyboardBuilder()
+    for slot in available_slots:
+        builder.add(KeyboardButton(text=slot))
+    # Размещаем кнопки по 2 в ряд
+    builder.adjust(2)
+    # Кнопку "Назад" добавляем на отдельный ряд
+    builder.row(KeyboardButton(text="⬅️ Назад к выбору даты"))
+    return builder.as_markup(resize_keyboard=True)
 
 def get_photo_keyboard() -> ReplyKeyboardMarkup:
     """Возвращает клавиатуру для шага загрузки фото."""

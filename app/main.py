@@ -9,9 +9,11 @@ from aiogram.types import TelegramObject
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.config import load_config
 from app.handlers import admin, client, executor
 from app.database.models import Base
+from app.scheduler import check_and_send_reminders
 
 class DbSessionMiddleware(BaseMiddleware):
     def __init__(self, session_pool: sessionmaker):
@@ -92,6 +94,15 @@ async def main():
     executor_dp.include_router(executor.router)
     admin_dp.include_router(admin.router)
 
+    scheduler = AsyncIOScheduler(timezone="Asia/Yekaterinburg")
+    scheduler.add_job(
+        check_and_send_reminders,
+        trigger="interval",
+        seconds=60,  # Проверять каждую минуту
+        kwargs={"bot": client_bot, "session_pool": session_maker, "admin_id": config.admin_id}
+    )
+    scheduler.start()
+
     try:
         await asyncio.gather(
             client_dp.start_polling(client_bot),
@@ -99,10 +110,12 @@ async def main():
             admin_dp.start_polling(admin_bot),
         )
     finally:
+        scheduler.shutdown()
         await client_bot.session.close()
         await executor_bot.session.close()
         await admin_bot.session.close()
         await engine.dispose()
+
 
 if __name__ == "__main__":
     try:

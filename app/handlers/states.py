@@ -14,3 +14,8 @@ class OrderStates(StatesGroup):
     entering_order_phone = State()
     confirming_order = State()
     choosing_payment_method = State()
+    editing_order = State()
+    editing_additional_services = State()
+    editing_address = State()
+    editing_room_count = State()
+    editing_bathroom_count = State()

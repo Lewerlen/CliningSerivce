@@ -76,3 +76,58 @@ async def get_order_by_id(session: AsyncSession, order_id: int):
         select(Order).options(selectinload(Order.items)).where(Order.id == order_id)
     )
     return result.scalar_one_or_none()
+
+async def update_order_datetime(session: AsyncSession, order_id: int, new_date: str, new_time: str):
+    """Обновляет дату и время заказа."""
+    order = await session.get(Order, order_id)
+    if order:
+        order.selected_date = new_date
+        order.selected_time = new_time
+        await session.commit()
+        return order
+    return None
+
+
+async def update_order_services_and_price(session: AsyncSession, order_id: int, new_services: set,
+                                          new_total_price: float):
+    """Обновляет доп. услуги и итоговую стоимость заказа."""
+    order = await get_order_by_id(session, order_id)
+    if not order:
+        return None
+
+    # Удаляем старые услуги, связанные с этим заказом
+    for item in order.items:
+        await session.delete(item)
+
+    # Добавляем новые услуги
+    for service_key in new_services:
+        order_item = OrderItem(order_id=order.id, service_key=service_key)
+        session.add(order_item)
+
+    # Обновляем цену
+    order.total_price = new_total_price
+
+    await session.commit()
+    return order
+
+async def update_order_address(session: AsyncSession, order_id: int, new_address: str, new_lat: float | None, new_lon: float | None):
+    """Обновляет адрес заказа."""
+    order = await session.get(Order, order_id)
+    if order:
+        order.address_text = new_address
+        order.address_lat = new_lat
+        order.address_lon = new_lon
+        await session.commit()
+        return order
+    return None
+
+async def update_order_rooms_and_price(session: AsyncSession, order_id: int, new_room_count: str, new_bathroom_count: str, new_total_price: float):
+    """Обновляет количество комнат, санузлов и итоговую стоимость заказа."""
+    order = await session.get(Order, order_id)
+    if order:
+        order.room_count = new_room_count
+        order.bathroom_count = new_bathroom_count
+        order.total_price = new_total_price
+        await session.commit()
+        return order
+    return None
