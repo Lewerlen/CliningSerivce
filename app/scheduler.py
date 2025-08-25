@@ -2,7 +2,7 @@ import datetime
 from sqlalchemy.future import select
 from aiogram import Bot
 
-from app.database.models import Order, OrderStatus
+from app.database.models import Order, OrderStatus, Ticket, TicketStatus
 from app.common.texts import RUSSIAN_MONTHS_GENITIVE
 from app.handlers.client import TYUMEN_TZ
 
@@ -65,5 +65,55 @@ async def check_and_send_reminders(bot: Bot, session_pool, admin_id: int): # Д�
                     order.reminder_2h_sent = True
             except Exception as e:
                 print(f"Ошибка при обработке 2h напоминания для заказа {order.id}: {e}")
+
+        await session.commit()
+
+async def check_and_auto_close_tickets(bot: Bot, session_pool):
+    """
+    Проверяет тикеты со статусом 'Ответ получен' и закрывает их, если нет активности.
+    """
+    now = datetime.datetime.now()
+    # Временные рамки
+    h24_ago = now - datetime.timedelta(hours=24)
+    h48_ago = now - datetime.timedelta(hours=48)
+
+    async with session_pool() as session:
+        # 1. Ищем тикеты для отправки 24-часового предупреждения
+        stmt_remind = select(Ticket).where(
+            Ticket.status == TicketStatus.answered,
+            Ticket.updated_at < h24_ago,
+            Ticket.autoclose_reminder_sent == False
+        )
+        tickets_to_remind = await session.execute(stmt_remind)
+        for ticket in tickets_to_remind.scalars().all():
+            try:
+                text = (
+                    f"👋 Напоминаем по вашему обращению №{ticket.id}.\n\n"
+                    f"Если ваш вопрос не решен, пожалуйста, ответьте на это сообщение. "
+                    f"В противном случае, обращение будет автоматически закрыто через 24 часа."
+                )
+                await bot.send_message(chat_id=ticket.user_tg_id, text=text)
+                ticket.autoclose_reminder_sent = True
+            except Exception as e:
+                print(f"Ошибка при отправке 24ч напоминания по тикету {ticket.id}: {e}")
+
+        # 2. Ищем тикеты для автозакрытия
+        stmt_close = select(Ticket).where(
+            Ticket.status == TicketStatus.answered,
+            Ticket.updated_at < h48_ago
+        )
+        tickets_to_close = await session.execute(stmt_close)
+        for ticket in tickets_to_close.scalars().all():
+            try:
+                ticket.status = TicketStatus.closed
+                ticket.was_autoclosed = True
+                text = (
+                    f"✅ Ваше обращение №{ticket.id} было автоматически закрыто, "
+                    f"так как мы не получили от вас ответа в течение 48 часов. "
+                    f"Если проблема осталась, создайте, пожалуйста, новое обращение."
+                )
+                await bot.send_message(chat_id=ticket.user_tg_id, text=text)
+            except Exception as e:
+                print(f"Ошибка при автозакрытии тикета {ticket.id}: {e}")
 
         await session.commit()

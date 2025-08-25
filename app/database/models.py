@@ -95,3 +95,43 @@ class OrderItem(Base):
 
     # Связь с таблицей orders
     order = relationship("Order", back_populates="items")
+
+class TicketStatus(enum.Enum):
+    new = "Новый"
+    in_progress = "В работе"
+    answered = "Ответ получен"
+    closed = "Закрыт"
+
+class Ticket(Base):
+    __tablename__ = 'tickets'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_tg_id = Column(BigInteger, ForeignKey('users.telegram_id'), nullable=False)
+    admin_tg_id = Column(BigInteger, nullable=True) # ID админа, который взял тикет
+    status = Column(Enum(TicketStatus), default=TicketStatus.new, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.now)
+    updated_at = Column(DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now)
+
+    # Поля для автозакрытия
+    autoclose_reminder_sent = Column(Boolean, default=False, nullable=False)
+    was_autoclosed = Column(Boolean, default=False, nullable=False)
+
+    user = relationship("User")
+    messages = relationship("TicketMessage", back_populates="ticket", cascade="all, delete-orphan")
+
+
+class MessageAuthor(enum.Enum):
+    client = "client"
+    admin = "admin"
+
+class TicketMessage(Base):
+    __tablename__ = 'ticket_messages'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ticket_id = Column(Integer, ForeignKey('tickets.id'), nullable=False)
+    author = Column(Enum(MessageAuthor), nullable=False)
+    text = Column(String, nullable=False)
+    photo_file_id = Column(String) # Для прикрепленных фото
+    created_at = Column(DateTime, default=datetime.datetime.now)
+
+    ticket = relationship("Ticket", back_populates="messages")

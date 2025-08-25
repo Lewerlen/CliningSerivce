@@ -1,7 +1,8 @@
+import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
-from app.database.models import User, UserRole, Order, OrderItem, OrderStatus
+from app.database.models import User, UserRole, Order, OrderItem, OrderStatus, Ticket, TicketMessage, MessageAuthor, TicketStatus
 
 async def get_user(session: AsyncSession, telegram_id: int) -> User | None:
     """Возвращает пользователя по его telegram_id или None, если пользователь не найден."""
@@ -131,3 +132,92 @@ async def update_order_rooms_and_price(session: AsyncSession, order_id: int, new
         await session.commit()
         return order
     return None
+
+async def create_ticket(session: AsyncSession, user_tg_id: int, message_text: str, photo_id: str | None = None) -> Ticket | None:
+    """Создает новый тикет и первое сообщение к нему."""
+    # Создаем сам тикет
+    new_ticket = Ticket(user_tg_id=user_tg_id)
+    session.add(new_ticket)
+    await session.flush() # Это нужно, чтобы получить ID нового тикета для связи
+
+    # Создаем первое сообщение от клиента
+    first_message = TicketMessage(
+        ticket_id=new_ticket.id,
+        author=MessageAuthor.client,
+        text=message_text,
+        photo_file_id=photo_id
+    )
+    session.add(first_message)
+
+    await session.commit()
+    return new_ticket
+
+async def get_user_tickets(session: AsyncSession, user_tg_id: int) -> list[Ticket]:
+    """Возвращает список всех тикетов пользователя, отсортированных по дате обновления."""
+    result = await session.execute(
+        select(Ticket)
+        .options(selectinload(Ticket.messages))
+        .where(Ticket.user_tg_id == user_tg_id)
+        .order_by(Ticket.updated_at.desc())
+    )
+    return result.scalars().all()
+
+async def get_ticket_by_id(session: AsyncSession, ticket_id: int) -> Ticket | None:
+    """Возвращает один тикет со всеми сообщениями по его ID."""
+    result = await session.execute(
+        select(Ticket)
+        .options(selectinload(Ticket.messages), selectinload(Ticket.user)) # Добавили загрузку пользователя
+        .where(Ticket.id == ticket_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_tickets_by_status(session: AsyncSession, status: TicketStatus) -> list[Ticket]:
+    """Возвращает список тикетов с определенным статусом."""
+    result = await session.execute(
+        select(Ticket)
+        .options(selectinload(Ticket.user), selectinload(Ticket.messages)) # Загружаем и пользователя, и сообщения
+        .where(Ticket.status == status)
+        .order_by(Ticket.created_at.asc())
+    )
+    return result.scalars().all()
+
+
+async def add_message_to_ticket(session: AsyncSession, ticket_id: int, author: MessageAuthor,
+                                text: str, photo_id: str | None = None) -> TicketMessage | None:
+    """Добавляет новое сообщение в тикет и обновляет дату тикета."""
+    ticket = await session.get(Ticket, ticket_id)
+    if not ticket:
+        return None
+
+    # Создаем новое сообщение
+    new_message = TicketMessage(
+        ticket_id=ticket_id,
+        author=author,
+        text=text,
+        photo_file_id=photo_id
+    )
+    session.add(new_message)
+
+    # Обновляем статус тикета и время последнего ответа
+    ticket.updated_at = datetime.datetime.now()
+    if author == MessageAuthor.admin:
+        ticket.status = TicketStatus.answered
+    elif author == MessageAuthor.client:
+        # Если отвечает клиент, возвращаем тикет в работу
+        ticket.status = TicketStatus.in_progress
+
+
+    await session.commit()
+    return new_message
+
+
+async def update_ticket_status(session: AsyncSession, ticket_id: int, status: TicketStatus, admin_tg_id: int | None = None) -> Ticket | None:
+    """Обновляет статус тикета и опционально назначает администратора."""
+    ticket = await session.get(Ticket, ticket_id)
+    if ticket:
+        ticket.status = status
+        if admin_tg_id:
+            ticket.admin_tg_id = admin_tg_id
+        await session.commit()
+    return ticket

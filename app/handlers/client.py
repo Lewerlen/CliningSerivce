@@ -4,16 +4,17 @@ from contextlib import suppress
 from zoneinfo import ZoneInfo
 
 from aiogram import F, Router, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.handlers.states import OrderStates
+from app.handlers.states import OrderStates, SupportStates
 from app.keyboards.client_kb import (
     ADDITIONAL_SERVICES,
+    get_support_menu_keyboard,
     create_calendar,
     get_active_orders_keyboard,
     get_view_order_keyboard,
@@ -33,9 +34,13 @@ from app.keyboards.client_kb import (
     get_photo_keyboard,
     get_room_count_keyboard,
     get_time_keyboard,
+    get_view_ticket_keyboard,
+    get_my_tickets_keyboard,
+    get_skip_photo_keyboard,
 )
 from app.services.db_queries import (
     create_order,
+    create_ticket,
     create_user,
     get_user,
     get_user_orders,
@@ -44,8 +49,13 @@ from app.services.db_queries import (
     update_order_address,
     update_order_rooms_and_price,
     update_order_status,
-    OrderStatus, get_order_by_id
+    OrderStatus, get_order_by_id,
+    get_ticket_by_id,
+    get_user_tickets,
+    add_message_to_ticket,
+    update_ticket_status,
 )
+from app.database.models import MessageAuthor, TicketStatus
 from app.services.price_calculator import ADDITIONAL_SERVICE_PRICES, calculate_preliminary_cost
 from app.services.yandex_maps_api import get_address_from_coords, get_address_from_text
 from app.common.texts import STATUS_MAPPING, RUSSIAN_MONTHS_GENITIVE
@@ -569,9 +579,13 @@ async def repeat_order(callback: types.CallbackQuery, state: FSMContext, session
     await state.set_state(OrderStates.choosing_date)
 
 @router.message(F.text == "📞 Поддержка")
-async def support(message: types.Message):
-    """Обработчик кнопки 'Поддержка'."""
-    await message.answer("Это раздел поддержки. Вскоре мы его настроим.")
+async def support(message: types.Message, state: FSMContext):
+    """Показывает главное меню раздела поддержки."""
+    await state.clear() # Сбрасываем состояния на случай, если пользователь был в другом сценарии
+    await message.answer(
+        "Вы находитесь в разделе поддержки. Чем мы можем помочь?",
+        reply_markup=get_support_menu_keyboard()
+    )
 
 
 @router.callback_query(
@@ -1124,3 +1138,274 @@ async def back_to_additional_services(message: types.Message, state: FSMContext)
     await state.set_state(OrderStates.choosing_additional_services)
 
 # --- КОНЕЦ БЛОКА ---
+
+# --- БЛОК: ОБРАБОТЧИКИ ДЛЯ СИСТЕМЫ ПОДДЕРЖКИ ---
+
+@router.callback_query(F.data == "create_ticket")
+async def create_ticket_start(callback: types.CallbackQuery, state: FSMContext):
+    """Начинает процесс создания нового тикета."""
+    await callback.message.edit_text(
+        "Пожалуйста, подробно опишите вашу проблему или вопрос одним сообщением. "
+        "При необходимости, вы сможете прикрепить фото на следующем шаге."
+    )
+    await state.set_state(SupportStates.creating_ticket_message)
+    await callback.answer()
+
+
+@router.message(SupportStates.creating_ticket_message, F.text)
+async def create_ticket_message_received(message: types.Message, state: FSMContext):
+    """Сохраняет текст обращения и предлагает прикрепить фото."""
+    # Сохраняем текст будущего тикета в состояние
+    await state.update_data(ticket_text=message.text)
+
+    await message.answer(
+        "Спасибо! Теперь вы можете прикрепить одну фотографию, чтобы лучше описать проблему, или пропустить этот шаг.",
+        reply_markup=get_skip_photo_keyboard()
+    )
+    # Переводим на шаг ожидания фото
+    await state.set_state(SupportStates.waiting_for_ticket_photo)
+
+@router.callback_query(F.data == "my_tickets")
+async def my_tickets_list(callback: types.CallbackQuery, session: AsyncSession):
+    """Показывает список обращений пользователя."""
+    user_tickets = await get_user_tickets(session, user_tg_id=callback.from_user.id)
+
+    if not user_tickets:
+        await callback.message.edit_text(
+            "У вас пока нет обращений в поддержку.",
+            reply_markup=get_support_menu_keyboard() # Возвращаем клавиатуру меню поддержки
+        )
+    else:
+        await callback.message.edit_text(
+            "Ваши обращения в поддержку:",
+            reply_markup=get_my_tickets_keyboard(user_tickets)
+        )
+    await callback.answer()
+
+@router.callback_query(F.data == "back_to_support_menu")
+async def back_to_support_menu(callback: types.CallbackQuery):
+    """Возвращает в главное меню поддержки."""
+    await callback.message.edit_text(
+        "Вы находитесь в разделе поддержки. Чем мы можем помочь?",
+        reply_markup=get_support_menu_keyboard()
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("view_ticket:"))
+async def view_ticket(callback: types.CallbackQuery, session: AsyncSession):
+    """Показывает полную переписку по выбранному тикету, включая последнее фото."""
+    ticket_id = int(callback.data.split(":")[1])
+    ticket = await get_ticket_by_id(session, ticket_id)
+
+    if not ticket or ticket.user_tg_id != callback.from_user.id:
+        await callback.answer("Тикет не найден.", show_alert=True)
+        return
+
+    # --- Новая логика сборки ---
+    history = f"<b>Обращение №{ticket.id} от {ticket.created_at.strftime('%d.%m.%Y')}</b>\n"
+    history += f"Статус: <i>{ticket.status.value}</i>\n\n"
+
+    last_photo_id = None
+    # Собираем историю и ищем последнее фото в переписке
+    for message in sorted(ticket.messages, key=lambda m: m.created_at):
+        author = "Вы" if message.author == MessageAuthor.client else "Поддержка"
+        time = message.created_at.strftime('%H:%M')
+        history += f"<b>{author}</b> ({time}):\n{message.text}\n"
+        if message.photo_file_id:
+            history += "<i>К сообщению прикреплено фото.</i>\n"
+            last_photo_id = message.photo_file_id # Запоминаем ID последнего фото
+        history += "\n"
+
+    keyboard = get_view_ticket_keyboard(ticket)
+
+    # Удаляем предыдущее сообщение (список тикетов или уведомление) для чистоты
+    await callback.message.delete()
+
+    if last_photo_id:
+        # Если в истории есть фото, отправляем последнее из них с подписью
+        try:
+            await callback.message.answer_photo(
+                photo=last_photo_id,
+                caption=history,
+                reply_markup=keyboard
+            )
+        except TelegramBadRequest:
+            # Если file_id по какой-то причине невалиден, отправляем просто текст
+            await callback.message.answer(text=history, reply_markup=keyboard)
+    else:
+        # Если в истории нет фото, отправляем просто текстовое сообщение
+        await callback.message.answer(text=history, reply_markup=keyboard)
+
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("reply_ticket:"))
+async def reply_to_ticket_start(callback: types.CallbackQuery, state: FSMContext):
+    """Начинает процесс ответа на тикет."""
+    ticket_id = int(callback.data.split(":")[1])
+    await state.update_data(replying_ticket_id=ticket_id)
+
+    # Удаляем старое сообщение с историей, чтобы не мешалось
+    await callback.message.delete()
+    # И присылаем новое с просьбой ввести ответ
+    await callback.message.answer(
+        "Пожалуйста, напишите ваш ответ одним сообщением."
+    )
+    await state.set_state(SupportStates.replying_to_ticket)
+    await callback.answer()
+
+
+@router.message(SupportStates.replying_to_ticket, F.text)
+async def reply_to_ticket_message_received(message: types.Message, state: FSMContext, session: AsyncSession, bots: dict,
+                                           config: Settings):
+    """Принимает ответ клиента, добавляет его в тикет и уведомляет админа."""
+    user_data = await state.get_data()
+    ticket_id = user_data.get("replying_ticket_id")
+
+    # Добавляем сообщение в БД
+    await add_message_to_ticket(
+        session=session,
+        ticket_id=ticket_id,
+        author=MessageAuthor.client,
+        text=message.text
+    )
+
+    await message.answer("✅ Ваш ответ отправлен в поддержку.")
+    await state.clear()
+
+    # --- ИСПРАВЛЕНИЕ №2: Добавляем кнопку для админа ---
+    admin_text = (
+        f"💬 <b>Получен ответ по тикету №{ticket_id}</b>\n\n"
+        f"<b>От клиента:</b> @{message.from_user.username or message.from_user.full_name}\n\n"
+        f"<b>Текст:</b>\n{message.text}"
+    )
+    go_to_ticket_keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="➡️ Перейти к тикету", callback_data=f"admin_view_ticket:{ticket_id}")]
+    ])
+    await bots["admin"].send_message(
+        config.admin_id,
+        admin_text,
+        reply_markup=go_to_ticket_keyboard
+    )
+
+    # --- ИСПРАВЛЕНИЕ №1: Правильно показываем обновленный список тикетов ---
+    user_tickets = await get_user_tickets(session, user_tg_id=message.from_user.id)
+    await message.answer(
+        "Ваши обращения в поддержку:",
+        reply_markup=get_my_tickets_keyboard(user_tickets)
+    )
+
+
+@router.callback_query(F.data.startswith("close_ticket:"))
+async def close_ticket(callback: types.CallbackQuery, session: AsyncSession):
+    """Закрывает тикет по запросу пользователя."""
+    ticket_id = int(callback.data.split(":")[1])
+
+    await update_ticket_status(session, ticket_id, TicketStatus.closed)
+
+    await callback.answer("Обращение закрыто.", show_alert=True)
+
+    # Обновляем сообщение с историей, чтобы показать новый статус
+    await view_ticket(callback, session)
+
+
+async def finish_ticket_creation(message: types.Message, state: FSMContext, session: AsyncSession, bots: dict,
+                                 config: Settings, photo_id: str | None = None):
+    """Общая функция для завершения создания тикета."""
+    user_data = await state.get_data()
+    ticket_text = user_data.get("ticket_text")
+
+    new_ticket = await create_ticket(
+        session=session,
+        user_tg_id=message.from_user.id,
+        message_text=ticket_text,
+        photo_id=photo_id
+    )
+
+    if new_ticket:
+        await message.answer(
+            f"✅ Спасибо! Ваше обращение №{new_ticket.id} принято в работу.",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+
+        # --- НОВАЯ ЛОГИКА УВЕДОМЛЕНИЯ АДМИНА ---
+        admin_bot = bots["admin"]
+        client_bot = bots["client"]
+
+        # Формируем текст для подписи к фото или для отдельного сообщения
+        admin_caption = (
+            f"❗️ <b>Новое обращение в поддержку №{new_ticket.id}</b>\n\n"
+            f"<b>От клиента:</b> @{message.from_user.username or message.from_user.full_name} ({message.from_user.id})\n\n"
+            f"<b>Текст обращения:</b>\n{ticket_text}"
+        )
+
+        # Создаем inline-кнопку для быстрого перехода к тикету
+        go_to_ticket_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➡️ Перейти к тикету", callback_data=f"admin_view_ticket:{new_ticket.id}")]
+        ])
+
+        if photo_id:
+            # Скачиваем фото во временный объект в памяти
+            photo_file = await client_bot.get_file(photo_id)
+            photo_bytes_io = await client_bot.download_file(photo_file.file_path)
+            photo_bytes = photo_bytes_io.read()  # Читаем байты из объекта BytesIO
+
+            # Оборачиваем байты в BufferedInputFile для отправки
+            photo_to_send = BufferedInputFile(photo_bytes, filename="photo.jpg")
+
+            # Отправляем фото с подписью и КНОПКОЙ от имени АДМИН-БОТА
+            await admin_bot.send_photo(
+                chat_id=config.admin_id,
+                photo=photo_to_send,
+                caption=admin_caption,
+                reply_markup=go_to_ticket_keyboard
+            )
+        else:
+            # Если фото нет, просто отправляем текст и КНОПКУ от имени АДМИН-БОТА
+            await admin_bot.send_message(
+                config.admin_id,
+                admin_caption,
+                reply_markup=go_to_ticket_keyboard
+            )
+
+        # Показываем обновленный список тикетов клиенту
+        user_tickets = await get_user_tickets(session, user_tg_id=message.from_user.id)
+        await message.answer(
+            "Ваши обращения в поддержку:",
+            reply_markup=get_my_tickets_keyboard(user_tickets)
+        )
+    else:
+        await message.answer("Произошла ошибка при создании обращения. Пожалуйста, попробуйте снова.")
+
+    await state.clear()
+
+
+@router.message(SupportStates.waiting_for_ticket_photo, F.photo)
+async def ticket_photo_received(message: types.Message, state: FSMContext, session: AsyncSession, bots: dict,
+                                config: Settings):
+    """Принимает фото и завершает создание тикета."""
+    photo_id = message.photo[-1].file_id
+    await finish_ticket_creation(message, state, session, bots, config, photo_id)
+
+
+@router.message(SupportStates.waiting_for_ticket_photo, F.text == "➡️ Пропустить")
+async def ticket_photo_skipped(message: types.Message, state: FSMContext, session: AsyncSession, bots: dict,
+                               config: Settings):
+    """Пропускает шаг с фото и завершает создание тикета."""
+    await finish_ticket_creation(message, state, session, bots, config)
+
+
+@router.message(SupportStates.waiting_for_ticket_photo, F.text == "⬅️ Отменить создание тикета")
+async def ticket_creation_cancelled(message: types.Message, state: FSMContext):
+    """Отменяет создание тикета и возвращает в меню поддержки."""
+    await state.clear()
+    await message.answer(
+        "Создание обращения отменено.",
+        reply_markup=types.ReplyKeyboardRemove()
+    )
+    # Показываем меню поддержки
+    await message.answer(
+        "Вы находитесь в разделе поддержки. Чем мы можем помочь?",
+        reply_markup=get_support_menu_keyboard()
+    )

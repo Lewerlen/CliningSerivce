@@ -13,7 +13,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.config import load_config
 from app.handlers import admin, client, executor
 from app.database.models import Base
-from app.scheduler import check_and_send_reminders
+from app.scheduler import check_and_send_reminders, check_and_auto_close_tickets
 
 class DbSessionMiddleware(BaseMiddleware):
     def __init__(self, session_pool: sessionmaker):
@@ -98,8 +98,15 @@ async def main():
     scheduler.add_job(
         check_and_send_reminders,
         trigger="interval",
-        seconds=60,  # Проверять каждую минуту
+        seconds=60,
         kwargs={"bot": client_bot, "session_pool": session_maker, "admin_id": config.admin_id}
+    )
+    # Новая задача для автозакрытия тикетов (проверка каждые 10 минут)
+    scheduler.add_job(
+        check_and_auto_close_tickets,
+        trigger="interval",
+        minutes=10,
+        kwargs={"bot": client_bot, "session_pool": session_maker}
     )
     scheduler.start()
 

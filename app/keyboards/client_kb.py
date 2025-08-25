@@ -3,6 +3,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 import calendar
 from datetime import datetime
 from app.common.texts import STATUS_MAPPING
+from app.database.models import Ticket, TicketStatus
 
 # --- НОВЫЙ БЛОК: ВСЕ ДЛЯ КАЛЕНДАРЯ ---
 RUSSIAN_MONTHS = [
@@ -272,3 +273,48 @@ def get_address_confirmation_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="✏️ Ввести вручную")]
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+
+def get_support_menu_keyboard() -> InlineKeyboardMarkup:
+    """Возвращает клавиатуру для главного меню поддержки."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➕ Создать новое обращение", callback_data="create_ticket")
+    builder.button(text="📖 Мои обращения", callback_data="my_tickets")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_my_tickets_keyboard(tickets: list[Ticket]) -> InlineKeyboardMarkup:
+    """Создает клавиатуру со списком тикетов пользователя."""
+    builder = InlineKeyboardBuilder()
+    if tickets:
+        for ticket in tickets:
+            # Используем .value для получения красивого названия статуса из enum
+            status_text = ticket.status.value
+            # Берем первое сообщение в качестве темы
+            theme = ticket.messages[0].text[:20] if ticket.messages else "Без темы"
+            button_text = f"№{ticket.id} - «{theme}...» ({status_text})"
+            builder.button(text=button_text, callback_data=f"view_ticket:{ticket.id}")
+
+    builder.button(text="⬅️ Назад в поддержку", callback_data="back_to_support_menu")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_view_ticket_keyboard(ticket: Ticket) -> InlineKeyboardMarkup:
+    """Создает клавиатуру для просмотра тикета."""
+    builder = InlineKeyboardBuilder()
+
+    if ticket.status != TicketStatus.closed:
+        builder.button(text="💬 Ответить", callback_data=f"reply_ticket:{ticket.id}")
+        builder.button(text="✅ Закрыть обращение", callback_data=f"close_ticket:{ticket.id}")
+
+    builder.button(text="⬅️ Назад к списку", callback_data="my_tickets")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_skip_photo_keyboard() -> ReplyKeyboardMarkup:
+    """Возвращает клавиатуру с кнопкой 'Пропустить'."""
+    buttons = [
+        [KeyboardButton(text="➡️ Пропустить")],
+        [KeyboardButton(text="⬅️ Отменить создание тикета")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, one_time_keyboard=True)

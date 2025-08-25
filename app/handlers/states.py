@@ -19,3 +19,11 @@ class OrderStates(StatesGroup):
     editing_address = State()
     editing_room_count = State()
     editing_bathroom_count = State()
+
+class SupportStates(StatesGroup):
+    creating_ticket_message = State()
+    waiting_for_ticket_photo = State()
+    replying_to_ticket = State()
+
+class AdminSupportStates(StatesGroup):
+    replying_to_ticket = State()
