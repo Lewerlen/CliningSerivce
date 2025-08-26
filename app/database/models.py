@@ -1,8 +1,9 @@
-from sqlalchemy import (Column, Integer, String, BigInteger,
-                        Float, DateTime, Enum, ForeignKey, Boolean)
 from sqlalchemy.orm import declarative_base, relationship
 import datetime
 import enum
+from sqlalchemy import Column, Integer, String, BigInteger, \
+    Float, DateTime, Enum, ForeignKey, Boolean
+from sqlalchemy.dialects.postgresql import ARRAY
 
 Base = declarative_base()
 
@@ -27,6 +28,16 @@ class User(Base):
     status = Column(Enum(UserStatus), default=UserStatus.active, nullable=False) # [cite: 283]
     created_at = Column(DateTime, default=datetime.datetime.now)
 
+    referral_code = Column(String, unique=True, nullable=True)
+    referred_by = Column(BigInteger, nullable=True)
+    referral_balance = Column(Float, default=0.0)
+    referrals_count = Column(Integer, default=0)
+
+    average_rating = Column(Float, default=0.0)
+    review_count = Column(Integer, default=0)
+    consecutive_declines = Column(Integer, default=0, nullable=False)
+    blocked_until = Column(DateTime, nullable=True)  # Время окончания блокировки
+
 class ServiceType(enum.Enum):
     base = "base"
     additional = "additional"
@@ -42,9 +53,11 @@ class Service(Base):
 class OrderStatus(enum.Enum):
     new = "new"
     accepted = "accepted"
+    on_the_way = "on_the_way"
     in_progress = "in_progress"
     completed = "completed"
     cancelled = "cancelled"
+    pending_confirmation = "pending_confirmation"
 
 
 class Order(Base):
@@ -52,7 +65,9 @@ class Order(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     client_tg_id = Column(BigInteger, nullable=False)
+    executor_tg_id = Column(BigInteger, ForeignKey('users.telegram_id'), nullable=True) # ID исполнителя
     status = Column(Enum(OrderStatus), default=OrderStatus.new, nullable=False)
+    executor_payment = Column(Float, nullable=True) # Сумма выплаты исполнителю
 
     # Детали заказа
     cleaning_type = Column(String)
@@ -73,7 +88,8 @@ class Order(Base):
     order_phone = Column(String)
 
     # Фото и цена
-    photo_file_id = Column(String)
+    photo_file_ids = Column(ARRAY(String), nullable=True)  # Фото "до" от клиента
+    photos_after_ids = Column(ARRAY(String), nullable=True)  # Фото "после" от исполнителя
     total_price = Column(Float)
 
     created_at = Column(DateTime, default=datetime.datetime.now)
@@ -84,6 +100,11 @@ class Order(Base):
 
     # Связь с таблицей order_items
     items = relationship("OrderItem", back_populates="order")
+    executor = relationship("User", foreign_keys=[executor_tg_id])
+
+    rating = Column(Integer, nullable=True)
+    review_text = Column(String, nullable=True)
+
 
 
 class OrderItem(Base):
@@ -91,7 +112,8 @@ class OrderItem(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     order_id = Column(Integer, ForeignKey('orders.id'), nullable=False)
-    service_key = Column(String, nullable=False)  # Например, 'win' или 'sofa'
+    service_key = Column(String, nullable=False)
+    quantity = Column(Integer, default=1, nullable=False)
 
     # Связь с таблицей orders
     order = relationship("Order", back_populates="items")
@@ -135,3 +157,28 @@ class TicketMessage(Base):
     created_at = Column(DateTime, default=datetime.datetime.now)
 
     ticket = relationship("Ticket", back_populates="messages")
+
+
+class ExecutorSchedule(Base):
+    __tablename__ = 'executor_schedules'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    executor_tg_id = Column(BigInteger, ForeignKey('users.telegram_id'), nullable=False, unique=True)
+
+    # Храним доступные временные слоты для каждого дня недели
+    monday = Column(ARRAY(String), default=[])
+    tuesday = Column(ARRAY(String), default=[])
+    wednesday = Column(ARRAY(String), default=[])
+    thursday = Column(ARRAY(String), default=[])
+    friday = Column(ARRAY(String), default=[])
+    saturday = Column(ARRAY(String), default=[])
+    sunday = Column(ARRAY(String), default=[])
+
+    executor = relationship("User")
+
+class DeclinedOrder(Base):
+    __tablename__ = 'declined_orders'
+
+    id = Column(Integer, primary_key=True)
+    order_id = Column(Integer, ForeignKey('orders.id'), nullable=False)
+    executor_tg_id = Column(BigInteger, ForeignKey('users.telegram_id'), nullable=False)

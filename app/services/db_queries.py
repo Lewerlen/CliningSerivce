@@ -2,7 +2,11 @@ import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
-from app.database.models import User, UserRole, Order, OrderItem, OrderStatus, Ticket, TicketMessage, MessageAuthor, TicketStatus
+from app.database.models import (User, UserRole, Order, OrderItem, OrderStatus, Ticket, TicketMessage, MessageAuthor,
+                                 TicketStatus, UserStatus, ExecutorSchedule, DeclinedOrder)
+import random
+import string
+from app.keyboards.executor_kb import WEEKDAYS
 
 async def get_user(session: AsyncSession, telegram_id: int) -> User | None:
     """Возвращает пользователя по его telegram_id или None, если пользователь не найден."""
@@ -21,7 +25,44 @@ async def create_user(session: AsyncSession, telegram_id: int, name: str, phone:
     await session.commit()
     return new_user
 
+async def register_executor(session: AsyncSession, telegram_id: int, name: str, phone: str, referred_by: int | None = None) -> User:
+    """Регистрирует пользователя как исполнителя, обновляет его роль и присваивает реферальный код."""
+    user = await get_user(session, telegram_id)
+    is_new_referral = False
 
+    if user:
+        # Если пользователь уже есть (например, был клиентом), обновляем его данные
+        user.role = UserRole.executor
+        user.phone = phone
+        user.status = UserStatus.active
+        if not user.referral_code: # Генерируем код, только если его еще нет
+            user.referral_code = generate_referral_code()
+        if referred_by and not user.referred_by: # Сохраняем пригласившего, если его еще нет
+            user.referred_by = referred_by
+            is_new_referral = True
+    else:
+        # Если пользователя нет, создаем нового
+        user = User(
+            telegram_id=telegram_id,
+            name=name,
+            phone=phone,
+            role=UserRole.executor,
+            status=UserStatus.active,
+            referral_code=generate_referral_code(),
+            referred_by=referred_by
+        )
+        session.add(user)
+        if referred_by:
+            is_new_referral = True
+
+    # Инкрементируем счетчик, если это новая успешная регистрация по ссылке
+    if is_new_referral:
+        referrer = await get_user(session, referred_by)
+        if referrer:
+            referrer.referrals_count += 1
+
+    await session.commit()
+    return user
 
 async def create_order(session: AsyncSession, data: dict, client_tg_id: int):
     """Создает заказ и связанные с ним доп. услуги в базе данных."""
@@ -39,16 +80,16 @@ async def create_order(session: AsyncSession, data: dict, client_tg_id: int):
         selected_time=data.get("selected_time"),
         order_name=data.get("order_name"),
         order_phone=data.get("order_phone"),
-        photo_file_id=data.get("photo_file_id"),
+        photo_file_ids=data.get("photo_ids"),
         total_price=data.get("total_cost")
     )
     session.add(new_order)
     await session.flush()  # Получаем id заказа для связи
 
     # Создаем записи для доп. услуг
-    selected_services = data.get("selected_services", set())
-    for service_key in selected_services:
-        order_item = OrderItem(order_id=new_order.id, service_key=service_key)
+    selected_services = data.get("selected_services", {})
+    for service_key, quantity in selected_services.items():
+        order_item = OrderItem(order_id=new_order.id, service_key=service_key, quantity=quantity)
         session.add(order_item)
 
     await session.commit()
@@ -88,6 +129,69 @@ async def update_order_datetime(session: AsyncSession, order_id: int, new_date: 
         return order
     return None
 
+async def get_orders_by_status(session: AsyncSession, status: OrderStatus, executor_tg_id: int = None) -> list[Order]:
+    """
+    Возвращает список заказов с определенным статусом.
+    Если передан executor_tg_id, исключает заказы, от которых он отказался.
+    """
+    stmt = select(Order).where(Order.status == status)
+
+    if executor_tg_id:
+        # Находим ID заказов, от которых исполнитель отказался
+        declined_stmt = select(DeclinedOrder.order_id).where(DeclinedOrder.executor_tg_id == executor_tg_id)
+        declined_result = await session.execute(declined_stmt)
+        declined_order_ids = declined_result.scalars().all()
+
+        if declined_order_ids:
+            # Исключаем эти заказы из основного запроса
+            stmt = stmt.where(Order.id.notin_(declined_order_ids))
+
+    stmt = stmt.order_by(Order.created_at.asc())
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+async def assign_executor_to_order(session: AsyncSession, order_id: int, executor_tg_id: int, payment_amount: float) -> Order | None:
+    """Назначает исполнителя на заказ, обновляет статус и сумму выплаты."""
+    order = await session.get(Order, order_id)
+    if order and order.status == OrderStatus.new:
+        order.executor_tg_id = executor_tg_id
+        order.status = OrderStatus.accepted
+        order.executor_payment = payment_amount
+        await session.commit()
+        return order
+    return None
+
+
+async def add_photo_to_order(session: AsyncSession, order_id: int, photo_file_id: str) -> Order | None:
+    """Добавляет file_id фотографии 'после' к заказу."""
+    order = await session.get(Order, order_id)
+    if order:
+        # Если списка еще нет, создаем его
+        if order.photos_after_ids is None:
+            order.photos_after_ids = []
+
+        # Добавляем новый file_id в список. SQLAlchemy отследит изменение.
+        order.photos_after_ids.append(photo_file_id)
+
+        # Принудительно помечаем поле как измененное для SQLAlchemy
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(order, "photos_after_ids")
+
+        await session.commit()
+        return order
+    return None
+
+async def get_executor_active_orders(session: AsyncSession, executor_tg_id: int) -> list[Order]:
+    """Возвращает список активных заказов ('accepted', 'on_the_way', 'in_progress') для конкретного исполнителя."""
+    result = await session.execute(
+        select(Order)
+        .where(
+            Order.executor_tg_id == executor_tg_id,
+            Order.status.in_([OrderStatus.accepted, OrderStatus.on_the_way, OrderStatus.in_progress])
+        )
+        .order_by(Order.created_at.asc())
+    )
+    return result.scalars().all()
 
 async def update_order_services_and_price(session: AsyncSession, order_id: int, new_services: set,
                                           new_total_price: float):
@@ -221,3 +325,215 @@ async def update_ticket_status(session: AsyncSession, ticket_id: int, status: Ti
             ticket.admin_tg_id = admin_tg_id
         await session.commit()
     return ticket
+
+
+async def get_matching_executors(session: AsyncSession, order_date_str: str, order_time_slot: str) -> list[User]:
+    """Возвращает список активных исполнителей, чей график соответствует заказу, либо всех, если у них нет графика."""
+
+    # 1. Определяем день недели заказа
+    try:
+        order_date = datetime.datetime.strptime(order_date_str, "%Y-%m-%d")
+        # weekday() возвращает 0 для пн, 1 для вт и т.д.
+        day_of_week_code = list(WEEKDAYS.keys())[order_date.weekday()]
+    except (ValueError, IndexError):
+        # Если дата некорректна, возвращаем пустой список
+        return []
+
+    # 2. Находим исполнителей с настроенным графиком, который подходит
+    schedule_day_column = getattr(ExecutorSchedule, day_of_week_code)
+
+    stmt_with_schedule = (
+        select(User)
+        .join(ExecutorSchedule, User.telegram_id == ExecutorSchedule.executor_tg_id)
+        .where(
+            User.role == UserRole.executor,
+            User.status == UserStatus.active,
+            schedule_day_column.any(order_time_slot)  # Проверяем, есть ли нужный слот в массиве
+        )
+    )
+    result_with_schedule = await session.execute(stmt_with_schedule)
+    executors_with_schedule = list(result_with_schedule.scalars().all())  # <-- Преобразуем в list
+
+    # 3. Находим исполнителей, у которых график не настроен (доступны всегда)
+    stmt_without_schedule = (
+        select(User)
+        .outerjoin(ExecutorSchedule, User.telegram_id == ExecutorSchedule.executor_tg_id)
+        .where(
+            User.role == UserRole.executor,
+            User.status == UserStatus.active,
+            ExecutorSchedule.id.is_(None)  # Условие, что графика нет
+        )
+    )
+    result_without_schedule = await session.execute(stmt_without_schedule)
+    executors_without_schedule = list(result_without_schedule.scalars().all())  # <-- Преобразуем в list
+
+    # 4. Объединяем и возвращаем
+    return executors_with_schedule + executors_without_schedule
+
+
+async def get_executor_schedule(session: AsyncSession, executor_tg_id: int) -> ExecutorSchedule | None:
+    """Возвращает график работы исполнителя."""
+    result = await session.execute(
+        select(ExecutorSchedule).where(ExecutorSchedule.executor_tg_id == executor_tg_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def update_executor_schedule(session: AsyncSession, executor_tg_id: int, schedule_data: dict) -> ExecutorSchedule:
+    """Обновляет или создает график работы для исполнителя."""
+    schedule = await get_executor_schedule(session, executor_tg_id)
+    if not schedule:
+        schedule = ExecutorSchedule(executor_tg_id=executor_tg_id)
+        session.add(schedule)
+
+    for day, slots in schedule_data.items():
+        setattr(schedule, day, slots)
+
+    await session.commit()
+    return schedule
+
+async def get_executor_completed_orders(session: AsyncSession, executor_tg_id: int, limit: int = 10) -> list[Order]:
+    """Возвращает список последних завершенных заказов исполнителя."""
+    result = await session.execute(
+        select(Order)
+        .where(
+            Order.executor_tg_id == executor_tg_id,
+            Order.status == OrderStatus.completed
+        )
+        .order_by(Order.created_at.desc())
+        .limit(limit)
+    )
+    return result.scalars().all()
+
+async def get_user_by_referral_code(session: AsyncSession, referral_code: str) -> User | None:
+    """Находит пользователя по его реферальному коду."""
+    result = await session.execute(
+        select(User).where(User.referral_code == referral_code)
+    )
+    return result.scalar_one_or_none()
+
+async def credit_referral_bonus(session: AsyncSession, referrer_id: int, bonus_amount: int = 500):
+    """Начисляет бонус пригласившему."""
+    referrer = await get_user(session, referrer_id)
+    if referrer:
+        referrer.referral_balance += bonus_amount
+        await session.commit()
+
+# --- Вспомогательная функция для генерации кода ---
+def generate_referral_code(length: int = 8) -> str:
+    """Генерирует случайный реферальный код."""
+    # Создаем код вида 'ref' + случайные буквы и цифры
+    random_part = ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
+    return f"ref{random_part}"
+
+# --- БЛОК: ФУНКЦИИ ДЛЯ РЕЙТИНГОВ ---
+
+async def save_order_rating(session: AsyncSession, order_id: int, rating: int, review_text: str) -> Order | None:
+    """Сохраняет оценку и текст отзыва для конкретного заказа."""
+    order = await session.get(Order, order_id)
+    if order:
+        order.rating = rating
+        order.review_text = review_text
+        await session.commit()
+        return order
+    return None
+
+async def update_executor_rating(session: AsyncSession, executor_tg_id: int):
+    """Пересчитывает и обновляет средний рейтинг и количество отзывов для исполнителя."""
+    # Выбираем все заказы с оценкой для данного исполнителя
+    stmt = select(Order.rating).where(
+        Order.executor_tg_id == executor_tg_id,
+        Order.rating.isnot(None)
+    )
+    result = await session.execute(stmt)
+    ratings = result.scalars().all()
+
+    executor = await get_user(session, executor_tg_id)
+    if executor:
+        if ratings:
+            executor.average_rating = round(sum(ratings) / len(ratings), 2)
+            executor.review_count = len(ratings)
+        else:
+            executor.average_rating = 0.0
+            executor.review_count = 0
+        await session.commit()
+
+async def get_executor_orders_with_reviews(session: AsyncSession, executor_tg_id: int, limit: int = 5) -> list[Order]:
+    """Возвращает последние заказы исполнителя, по которым есть отзывы."""
+    result = await session.execute(
+        select(Order)
+        .where(
+            Order.executor_tg_id == executor_tg_id,
+            Order.rating.isnot(None),
+            Order.review_text.isnot(None)
+        )
+        .order_by(Order.created_at.desc())
+        .limit(limit)
+    )
+    return result.scalars().all()
+# --- КОНЕЦ БЛОКА ---
+
+async def unassign_executor_from_order(session: AsyncSession, order_id: int) -> Order | None:
+    """Снимает исполнителя с заказа и возвращает заказ в статус 'new'."""
+    order = await session.get(Order, order_id)
+    if order:
+        order.executor_tg_id = None
+        order.status = OrderStatus.new
+        order.reminder_24h_sent = False # Сбрасываем флаги напоминаний
+        order.reminder_2h_sent = False
+        await session.commit()
+        return order
+    return None
+
+
+async def increment_and_get_declines(session: AsyncSession, telegram_id: int) -> User | None:
+    """Увеличивает счетчик последовательных отказов и возвращает пользователя."""
+    user = await get_user(session, telegram_id)
+    if user:
+        user.consecutive_declines += 1
+        await session.commit()
+        return user
+    return None
+
+async def reset_consecutive_declines(session: AsyncSession, telegram_id: int):
+    """Сбрасывает счетчик последовательных отказов."""
+    user = await get_user(session, telegram_id)
+    if user and user.consecutive_declines > 0:
+        user.consecutive_declines = 0
+        await session.commit()
+
+async def block_user_temporarily(session: AsyncSession, telegram_id: int, hours: int = 12) -> User | None:
+    """Блокирует пользователя на определенное количество часов."""
+    user = await get_user(session, telegram_id)
+    if user:
+        user.status = UserStatus.blocked
+        user.blocked_until = datetime.datetime.now() + datetime.timedelta(hours=hours)
+        user.consecutive_declines = 0
+        await session.commit()
+        return user
+    return None
+
+async def unblock_user(session: AsyncSession, telegram_id: int) -> User | None:
+    """Снимает блокировку с пользователя."""
+    user = await get_user(session, telegram_id)
+    if user and user.status == UserStatus.blocked:
+        user.status = UserStatus.active
+        user.blocked_until = None
+        await session.commit()
+        return user
+    return None
+
+async def update_user_phone(session: AsyncSession, telegram_id: int, phone: str) -> User | None:
+    """Обновляет номер телефона пользователя."""
+    user = await get_user(session, telegram_id)
+    if user and not user.phone: # Обновляем, только если телефон еще не указан
+        user.phone = phone
+        await session.commit()
+        return user
+    return user
+
+async def add_declined_order(session: AsyncSession, order_id: int, executor_tg_id: int):
+    """Добавляет запись об отказе исполнителя от заказа."""
+    new_decline = DeclinedOrder(order_id=order_id, executor_tg_id=executor_tg_id)
+    session.add(new_decline)
+    await session.commit()

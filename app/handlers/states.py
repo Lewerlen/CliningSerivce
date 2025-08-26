@@ -19,6 +19,11 @@ class OrderStates(StatesGroup):
     editing_address = State()
     editing_room_count = State()
     editing_bathroom_count = State()
+    entering_service_quantity = State()
+
+class RatingStates(StatesGroup):
+    waiting_for_rating = State()
+    waiting_for_review = State()
 
 class SupportStates(StatesGroup):
     creating_ticket_message = State()
@@ -27,3 +32,12 @@ class SupportStates(StatesGroup):
 
 class AdminSupportStates(StatesGroup):
     replying_to_ticket = State()
+
+class ExecutorRegistration(StatesGroup):
+    waiting_for_phone = State()
+    uploading_photo = State()
+    waiting_for_completion_confirmation = State()
+    editing_schedule = State()
+
+class ChatStates(StatesGroup):
+    in_chat = State()

@@ -3,7 +3,9 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 import calendar
 from datetime import datetime
 from app.common.texts import STATUS_MAPPING
-from app.database.models import Ticket, TicketStatus
+from app.database.models import Ticket, TicketStatus, Order, OrderStatus
+
+
 
 # --- НОВЫЙ БЛОК: ВСЕ ДЛЯ КАЛЕНДАРЯ ---
 RUSSIAN_MONTHS = [
@@ -87,12 +89,17 @@ def get_active_orders_keyboard(orders: list) -> InlineKeyboardMarkup:
     builder.adjust(1)  # Все кнопки в один столбец
     return builder.as_markup()
 
-def get_view_order_keyboard(order_id: int, can_be_edited: bool) -> InlineKeyboardMarkup:
+def get_view_order_keyboard(order: Order, can_be_edited: bool) -> InlineKeyboardMarkup:
     """Создает клавиатуру для просмотра активного заказа."""
     builder = InlineKeyboardBuilder()
+
+    # Кнопка чата появляется, только если исполнитель назначен
+    if order.status in {OrderStatus.accepted, OrderStatus.on_the_way, OrderStatus.in_progress}:
+        builder.button(text="💬 Чат с исполнителем", callback_data=f"start_chat:{order.id}")
+
     if can_be_edited:
-        builder.button(text="✏️ Изменить заказ", callback_data=f"edit_order:{order_id}")
-    builder.button(text="❌ Отменить заказ", callback_data=f"cancel_order:{order_id}")
+        builder.button(text="✏️ Изменить заказ", callback_data=f"edit_order:{order.id}")
+    builder.button(text="❌ Отменить заказ", callback_data=f"cancel_order:{order.id}")
     builder.button(text="⬅️ Назад к заказам", callback_data="back_to_orders_list")
     builder.adjust(1)
     return builder.as_markup()
@@ -173,18 +180,25 @@ ADDITIONAL_SERVICES = {
 }
 
 
-def get_additional_services_keyboard(selected_services: set = None) -> InlineKeyboardMarkup:
+def get_additional_services_keyboard(selected_services: dict = None) -> InlineKeyboardMarkup:
     """
     Возвращает inline-клавиатуру для выбора доп. услуг.
-    Отмечает галочкой уже выбранные услуги.
+    Отмечает галочкой и количеством уже выбранные услуги.
     """
     if selected_services is None:
-        selected_services = set()
+        selected_services = {}
 
-    builder = InlineKeyboardBuilder()  # Используем билдер для удобства
+    builder = InlineKeyboardBuilder()
     for key, text in ADDITIONAL_SERVICES.items():
-        if key in selected_services:
-            button_text = f"✅ {text}"
+        quantity = selected_services.get(key)
+        if quantity:
+            # Убираем цену из названия, чтобы не было дублирования
+            base_text = text.split('(')[0].strip()
+            # Для услуг с количеством добавляем "шт."
+            if key in {"win", "chair"}:
+                button_text = f"✅ {base_text} ({quantity} шт.)"
+            else:
+                button_text = f"✅ {base_text}"
         else:
             button_text = text
         builder.button(text=button_text, callback_data=f"add_service_{key}")
@@ -230,7 +244,7 @@ def get_time_keyboard(available_slots: list) -> ReplyKeyboardMarkup:
 def get_photo_keyboard() -> ReplyKeyboardMarkup:
     """Возвращает клавиатуру для шага загрузки фото."""
     buttons = [
-        [KeyboardButton(text="➡️ Пропустить")],
+        [KeyboardButton(text="✅ Продолжить")],
         [KeyboardButton(text="⬅️ Назад к выбору времени")]
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
@@ -318,3 +332,28 @@ def get_skip_photo_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="⬅️ Отменить создание тикета")]
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, one_time_keyboard=True)
+
+# --- ЛОК: КЛАВИАТУРА ДЛЯ ОЦЕНКИ ---
+def get_rating_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    """Создает клавиатуру для выбора оценки от 1 до 5."""
+    builder = InlineKeyboardBuilder()
+    stars = ["⭐", "⭐⭐", "⭐⭐⭐", "⭐⭐⭐⭐", "⭐⭐⭐⭐⭐"]
+    for i, star in enumerate(stars, 1):
+        builder.button(text=star, callback_data=f"set_rating:{order_id}:{i}")
+    builder.adjust(1)
+    return builder.as_markup()
+# --- КОНЕЦ БЛОКА ---
+
+def get_exit_chat_keyboard() -> ReplyKeyboardMarkup:
+    """Возвращает клавиатуру с кнопкой выхода из чата."""
+    buttons = [
+        [KeyboardButton(text="⬅️ Выйти из чата")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+
+def get_reply_to_chat_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    """Создает клавиатуру с кнопкой 'Ответить' для чата."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💬 Ответить", callback_data=f"start_chat:{order_id}")
+    return builder.as_markup()
+

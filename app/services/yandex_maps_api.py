@@ -39,8 +39,7 @@ async def get_address_from_text(address_text: str, api_key: str) -> str | None:
         "geocode": address_text,
         "apikey": api_key,
         "format": "json",
-        "results": 1,
-        "bbox": "64.0,56.0~72.0,59.0"
+        "results": 1
     }
 
     try:

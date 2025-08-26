@@ -4,9 +4,11 @@ from app.database.models import OrderStatus
 STATUS_MAPPING = {
     OrderStatus.new: "✅ Принят, ищем исполнителя",
     OrderStatus.accepted: "🤝 Исполнитель назначен",
+    OrderStatus.on_the_way: "🚀 Исполнитель в пути",
     OrderStatus.in_progress: "🧼 Уборка в процессе",
     OrderStatus.completed: "🎉 Завершен",
-    OrderStatus.cancelled: "❌ Отменен"
+    OrderStatus.cancelled: "❌ Отменен",
+    OrderStatus.pending_confirmation: "⏳ Ожидает подтверждения изменений исполнителем"
 }
 
 # Список месяцев в родительном падеже для красивого вывода

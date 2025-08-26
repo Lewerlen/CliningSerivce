@@ -14,6 +14,7 @@ from app.config import load_config
 from app.handlers import admin, client, executor
 from app.database.models import Base
 from app.scheduler import check_and_send_reminders, check_and_auto_close_tickets
+from app.middlewares.album_middleware import AlbumMiddleware
 
 class DbSessionMiddleware(BaseMiddleware):
     def __init__(self, session_pool: sessionmaker):
@@ -80,6 +81,7 @@ async def main():
 
     client_dp.update.middleware(DbSessionMiddleware(session_pool=session_maker))
     executor_dp.update.middleware(DbSessionMiddleware(session_pool=session_maker))
+    executor_dp.message.middleware(AlbumMiddleware())
     admin_dp.update.middleware(DbSessionMiddleware(session_pool=session_maker))
 
     bots = {"client": client_bot, "executor": executor_bot, "admin": admin_bot}
@@ -99,7 +101,7 @@ async def main():
         check_and_send_reminders,
         trigger="interval",
         seconds=60,
-        kwargs={"bot": client_bot, "session_pool": session_maker, "admin_id": config.admin_id}
+        kwargs={"bots": bots, "session_pool": session_maker, "admin_id": config.admin_id}
     )
     # Новая задача для автозакрытия тикетов (проверка каждые 10 минут)
     scheduler.add_job(
