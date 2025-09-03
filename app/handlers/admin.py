@@ -4,14 +4,15 @@ from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile
 from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.database.models import TicketStatus, MessageAuthor
+from sqlalchemy.future import select
+from app.database.models import TicketStatus, MessageAuthor, UserRole, OrderStatus, Order
 from app.handlers.states import AdminSupportStates
 from app.services.db_queries import (
     get_tickets_by_status,
     get_ticket_by_id,
     update_ticket_status,
-    add_message_to_ticket
+    add_message_to_ticket,
+    get_order_counts_by_status
 )
 from app.keyboards.admin_kb import (
     get_admin_main_keyboard,
@@ -21,6 +22,8 @@ from app.keyboards.admin_kb import (
     get_in_progress_ticket_keyboard,
     get_closed_ticket_keyboard,
     get_answered_ticket_keyboard,
+    get_admin_orders_keyboard,
+    get_orders_list_keyboard,
 )
 
 router = Router()
@@ -90,8 +93,12 @@ async def view_ticket_admin(callback: types.CallbackQuery, session: AsyncSession
         await callback.answer("Тикет не найден.", show_alert=True)
         return
 
+    author_role = "клиента"
+    if ticket.user.role == UserRole.executor:
+        author_role = "исполнителя"
+
     # Собираем историю переписки
-    history = f"<b>Обращение №{ticket.id} от клиента {ticket.user.name or ticket.user_tg_id}</b>\n"
+    history = f"<b>Обращение №{ticket.id} от {author_role} {ticket.user.name or ticket.user.tg_id}</b>\n"
     history += f"Статус: <i>{ticket.status.value}</i>\n\n"
     photo_id = None
 
@@ -312,4 +319,80 @@ async def admin_close_ticket(callback: types.CallbackQuery, session: AsyncSessio
     except Exception as e:
         await callback.message.answer(f"⚠️ Не удалось уведомить клиента о закрытии: {e}")
 
+    await callback.answer()
+
+@router.message(F.text == "📋 Управление заказами")
+async def manage_orders(message: types.Message, session: AsyncSession):
+    counts = await get_order_counts_by_status(session)
+    await message.answer(
+        "🗂️ Выберите категорию заказов для просмотра:",
+        reply_markup=get_admin_orders_keyboard(counts)
+    )
+
+@router.message(F.text == "🛠️ Управление исполнителями")
+async def manage_executors(message: types.Message):
+    await message.answer("Раздел управления исполнителями. Здесь можно будет просматривать список исполнителей, их рейтинг, баланс и статус.")
+
+@router.message(F.text == "📊 Статистика")
+async def view_statistics(message: types.Message):
+    await message.answer("Раздел статистики. Здесь будут отображаться отчеты по заказам, среднему чеку и лучшим исполнителям.")
+
+@router.message(F.text == "⚙️ Настройки")
+async def view_settings(message: types.Message):
+    await message.answer("Раздел настроек. Здесь можно будет управлять тарифами, комиссиями и другими параметрами системы.")
+
+# Добавляем эти новые функции в конец файла
+@router.callback_query(F.data == "admin_main_menu")
+async def back_to_admin_main_menu(callback: types.CallbackQuery, state: FSMContext):
+    """Возвращает в главное reply-меню администратора."""
+    await callback.message.delete()
+    await state.clear()
+    await callback.message.answer(
+        "Добро пожаловать в панель администратора.",
+        reply_markup=get_admin_main_keyboard()
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_manage_orders")
+async def back_to_manage_orders(callback: types.CallbackQuery, session: AsyncSession):
+    """Возвращает к меню выбора категорий заказов."""
+    counts = await get_order_counts_by_status(session)
+    await callback.message.edit_text(
+        "🗂️ Выберите категорию заказов для просмотра:",
+        reply_markup=get_admin_orders_keyboard(counts)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_orders:"))
+async def list_orders_by_status(callback: types.CallbackQuery, session: AsyncSession):
+    """Показывает список заказов в зависимости от выбранного статуса."""
+    list_type = callback.data.split(":")[1]
+
+    status_map = {
+        "new": ([OrderStatus.new], "🆕 Новые заказы"),
+        "in_progress": ([OrderStatus.accepted, OrderStatus.on_the_way, OrderStatus.in_progress], "⏳ Заказы в работе"),
+        "completed": ([OrderStatus.completed], "✅ Завершенные заказы"),
+        "cancelled": ([OrderStatus.cancelled], "❌ Отмененные заказы")
+    }
+
+    statuses, title = status_map.get(list_type, ([], "Неизвестная категория"))
+
+    if not statuses:
+        await callback.answer("Неизвестная категория.", show_alert=True)
+        return
+
+    stmt = select(Order).where(Order.status.in_(statuses)).order_by(Order.created_at.desc())
+    result = await session.execute(stmt)
+    orders = result.scalars().all()
+
+    if not orders:
+        await callback.answer(f"{title} отсутствуют.", show_alert=True)
+        return
+
+    text = f"<b>{title}:</b>"
+    reply_markup = get_orders_list_keyboard(orders, list_type)
+
+    await callback.message.edit_text(text, reply_markup=reply_markup)
     await callback.answer()

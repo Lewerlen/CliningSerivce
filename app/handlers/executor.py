@@ -5,10 +5,11 @@ from aiogram.filters import CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, BufferedInputFile
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
 from typing import List
 from app.config import Settings
-from app.database.models import UserRole, OrderStatus, UserStatus
-from app.handlers.states import ExecutorRegistration, ChatStates
+from app.database.models import UserRole, OrderStatus, UserStatus, DeclinedOrder, MessageAuthor, TicketStatus, Ticket
+from app.handlers.states import ExecutorRegistration, ChatStates, ExecutorSupportStates
 from app.keyboards.client_kb import ADDITIONAL_SERVICES
 from app.common.texts import STATUS_MAPPING
 from app.services.db_queries import (
@@ -25,7 +26,8 @@ from app.services.db_queries import (
     get_executor_completed_orders, get_user_by_referral_code,
     credit_referral_bonus, get_executor_orders_with_reviews,
     unassign_executor_from_order, increment_and_get_declines, reset_consecutive_declines, block_user_temporarily,
-    unblock_user, add_declined_order
+    unblock_user, add_declined_order, decline_active_offer, get_matching_executors, create_ticket, get_user_tickets,
+    get_ticket_by_id, add_message_to_ticket, update_ticket_status
 )
 
 from app.keyboards.executor_kb import (
@@ -38,7 +40,11 @@ from app.keyboards.executor_kb import (
     get_schedule_menu_keyboard,
     get_day_schedule_keyboard,
     WEEKDAYS, get_balance_orders_keyboard,
-    get_referral_program_keyboard
+    get_referral_program_keyboard,
+    get_executor_support_menu_keyboard,
+    get_executor_my_tickets_keyboard,
+    get_executor_view_ticket_keyboard,
+    get_executor_skip_photo_keyboard
 )
 
 router = Router()
@@ -225,41 +231,67 @@ async def executor_accept_order(callback: types.CallbackQuery, session: AsyncSes
 
 @router.callback_query(F.data.startswith("executor_decline_order:"))
 async def executor_decline_order(callback: types.CallbackQuery, session: AsyncSession, bots: dict, config: Settings):
-    """Обрабатывает отказ от заказа и применяет штрафную систему."""
+    """
+    Обрабатывает отказ от заказа, применяет штрафы и НЕМЕДЛЕННО передает заказ следующему.
+    """
     order_id = int(callback.data.split(":")[1])
     executor_id = callback.from_user.id
 
-    # Запоминаем, что этот исполнитель отказался от заказа
+    # 1. Помечаем текущее предложение как отклоненное
+    await decline_active_offer(session, order_id, executor_id)
+    # Запоминаем, что этот исполнитель отказался от заказа, чтобы не предлагать снова
     await add_declined_order(session, order_id, executor_id)
 
-    # 1. Увеличиваем счетчик отказов
+    # 2. Применяем штрафную систему (этот блок без изменений)
     user = await increment_and_get_declines(session, executor_id)
-
-    if not user:
-        await callback.answer("Произошла ошибка, ваш профиль не найден.", show_alert=True)
-        return
-
-    # 2. Проверяем, не достигнут ли лимит
-    if user.consecutive_declines >= 3:
+    if user and user.consecutive_declines >= 3:
         blocked_user = await block_user_temporarily(session, executor_id, hours=12)
-        # Уведомляем исполнителя о блокировке
         await callback.message.edit_text(
             f"Вы отказались от заказа №{order_id}.\n\n"
             f"⚠️ <b>Вы были временно заблокированы на 12 часов за 3 отказа подряд.</b>\n"
-            f"Доступ к новым заказам будет восстановлен {blocked_user.blocked_until.strftime('%d.%m.%Y в %H:%M')}."
+            f"Доступ будет восстановлен {blocked_user.blocked_until.strftime('%d.%m.%Y в %H:%M')}."
         )
-        # Уведомляем админа
         await bots["admin"].send_message(
             config.admin_id,
-            f"⚠️ <b>Исполнитель @{callback.from_user.username or executor_id} был заблокирован на 12 часов</b> "
-            f"за 3 последовательных отказа от заказов."
+            f"⚠️ <b>Исполнитель @{callback.from_user.username or executor_id} был заблокирован на 12 часов</b>."
         )
     else:
-        # Просто уведомляем об отказе и предупреждаем
         await callback.message.edit_text(
             f"Вы отказались от заказа №{order_id}.\n\n"
-            f"<u>Внимание:</u> у вас {user.consecutive_declines} отказ(а) подряд. "
+            f"<u>Внимание:</u> у вас {user.consecutive_declines if user else 0} отказ(а) подряд. "
             f"При 3 отказах подряд ваш аккаунт будет временно заблокирован."
+        )
+
+    # --- НОВАЯ ЛОГИКА: Мгновенный поиск следующего ---
+    order = await get_order_by_id(session, order_id)
+    if not order or order.status != OrderStatus.new:
+        await callback.answer()
+        return
+
+    all_executors = await get_matching_executors(session, order.selected_date, order.selected_time)
+
+    # Находим всех, кому уже предлагали или кто отказался
+    declined_stmt = select(DeclinedOrder.executor_tg_id).where(DeclinedOrder.order_id == order_id)
+    declined_result = await session.execute(declined_stmt)
+    declined_ids = set(declined_result.scalars().all())
+
+    # Ищем первого в списке, которому еще не предлагали
+    next_executor = None
+    for executor in all_executors:
+        if executor.telegram_id not in declined_ids:
+            next_executor = executor
+            break
+
+    # Если нашли, отправляем ему предложение
+    if next_executor:
+        from app.handlers.client import offer_order_to_executor  # Локальный импорт
+        await offer_order_to_executor(session, bots, order, next_executor)
+    else:
+        # Если исполнители кончились
+        await bots["admin"].send_message(
+            config.admin_id,
+            f"❗️<b>Никто не принял заказ №{order.id}.</b>\n"
+            "Очередь исполнителей закончилась. Рекомендуется ручное назначение."
         )
 
     await callback.answer()
@@ -825,6 +857,11 @@ async def forward_message_to_client(message: types.Message, state: FSMContext, b
     if not partner_id:
         return
 
+    # Если пользователь пытается отправить альбом, вежливо просим этого не делать
+    if message.media_group_id:
+        await message.answer("Пожалуйста, отправляйте фотографии по одной за раз.")
+        return
+
     client_bot = bots.get("client")
     prefix = f"💬 <b>[Исполнитель | Заказ №{order_id}]:</b>\n"
     reply_keyboard = get_reply_to_chat_keyboard(order_id)
@@ -833,19 +870,17 @@ async def forward_message_to_client(message: types.Message, state: FSMContext, b
         if message.text:
             await client_bot.send_message(partner_id, f"{prefix}{message.text}", reply_markup=reply_keyboard)
         elif message.photo:
-            # Скачиваем фото через текущего бота (executor_bot)
             photo_file = await message.bot.get_file(message.photo[-1].file_id)
             photo_bytes_io = await message.bot.download_file(photo_file.file_path)
             photo_to_send = BufferedInputFile(photo_bytes_io.read(), filename="photo.jpg")
 
-            # Отправляем фото с подписью через клиент-бота
             await client_bot.send_photo(
                 chat_id=partner_id,
                 photo=photo_to_send,
                 caption=f"{prefix}{message.caption or ''}",
                 reply_markup=reply_keyboard
             )
-        # Сюда можно добавить обработку других типов сообщений (документы, аудио и т.д.)
+
         await message.answer("✅ Ваше сообщение отправлено.")
 
     except Exception as e:
@@ -918,4 +953,168 @@ async def executor_decline_changes(callback: types.CallbackQuery, session: Async
     else:
         await callback.message.edit_text("❌ Не удалось обновить заказ.")
 
+    await callback.answer()
+
+# --- БЛОК: СИСТЕМА ПОДДЕРЖКИ ДЛЯ ИСПОЛНИТЕЛЯ ---
+
+@router.message(F.text == "🆘 Помощь")
+async def executor_support_menu(message: types.Message, state: FSMContext):
+    """Показывает главное меню раздела поддержки для исполнителя."""
+    await state.clear()
+    await message.answer(
+        "Вы находитесь в разделе поддержки. Чем мы можем помочь?",
+        reply_markup=get_executor_support_menu_keyboard()
+    )
+
+@router.callback_query(F.data == "executor_create_ticket")
+async def executor_create_ticket_start(callback: types.CallbackQuery, state: FSMContext):
+    """Начинает процесс создания нового тикета от исполнителя."""
+    await callback.message.edit_text(
+        "Пожалуйста, подробно опишите вашу проблему или вопрос одним сообщением. "
+        "При необходимости, вы сможете прикрепить фото на следующем шаге."
+    )
+    await state.set_state(ExecutorSupportStates.creating_ticket_message)
+    await callback.answer()
+
+@router.message(ExecutorSupportStates.creating_ticket_message, F.text)
+async def executor_ticket_message_received(message: types.Message, state: FSMContext):
+    """Сохраняет текст обращения и предлагает прикрепить фото."""
+    await state.update_data(ticket_text=message.text)
+    await message.answer(
+        "Спасибо! Теперь вы можете прикрепить одну фотографию, чтобы лучше описать проблему, или пропустить этот шаг.",
+        reply_markup=get_executor_skip_photo_keyboard()
+    )
+    await state.set_state(ExecutorSupportStates.waiting_for_ticket_photo)
+
+@router.callback_query(F.data == "executor_my_tickets")
+async def executor_my_tickets_list(callback: types.CallbackQuery, session: AsyncSession):
+    """Показывает список обращений исполнителя."""
+    user_tickets = await get_user_tickets(session, user_tg_id=callback.from_user.id)
+    if not user_tickets:
+        await callback.message.edit_text(
+            "У вас пока нет обращений в поддержку.",
+            reply_markup=get_executor_support_menu_keyboard()
+        )
+    else:
+        await callback.message.edit_text(
+            "Ваши обращения в поддержку:",
+            reply_markup=get_executor_my_tickets_keyboard(user_tickets)
+        )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("executor_view_ticket:"))
+async def executor_view_ticket(callback: types.CallbackQuery, session: AsyncSession):
+    """Показывает полную переписку по выбранному тикету."""
+    ticket_id = int(callback.data.split(":")[1])
+    ticket = await get_ticket_by_id(session, ticket_id)
+
+    if not ticket or ticket.user_tg_id != callback.from_user.id:
+        await callback.answer("Тикет не найден.", show_alert=True)
+        return
+
+    history = f"<b>Обращение №{ticket.id} от {ticket.created_at.strftime('%d.%m.%Y')}</b>\n"
+    history += f"Статус: <i>{ticket.status.value}</i>\n\n"
+
+    last_photo_id = None
+    for message in sorted(ticket.messages, key=lambda m: m.created_at):
+        author = "Вы" if message.author == MessageAuthor.client else "Поддержка"
+        time = message.created_at.strftime('%H:%M')
+        history += f"<b>{author}</b> ({time}):\n{message.text}\n"
+        if message.photo_file_id:
+            history += "<i>К сообщению прикреплено фото.</i>\n"
+            last_photo_id = message.photo_file_id
+        history += "\n"
+
+    keyboard = get_executor_view_ticket_keyboard(ticket)
+    await callback.message.delete()
+
+    if last_photo_id:
+        try:
+            # Фото могло быть загружено через любого бота, пробуем через executor-бота
+            await callback.message.answer_photo(photo=last_photo_id, caption=history, reply_markup=keyboard)
+        except Exception:
+            await callback.message.answer(text=history, reply_markup=keyboard)
+    else:
+        await callback.message.answer(text=history, reply_markup=keyboard)
+    await callback.answer()
+
+async def finish_executor_ticket_creation(message: types.Message, state: FSMContext, session: AsyncSession, bots: dict, config: Settings, photo_id: str | None = None):
+    """Общая функция для завершения создания тикета от исполнителя."""
+    user_data = await state.get_data()
+    ticket_text = user_data.get("ticket_text")
+
+    new_ticket = await create_ticket(
+        session=session,
+        user_tg_id=message.from_user.id,
+        message_text=ticket_text,
+        photo_id=photo_id
+    )
+
+    if new_ticket:
+        await message.answer(
+            f"✅ Спасибо! Ваше обращение №{new_ticket.id} принято в работу.",
+            reply_markup=get_executor_main_keyboard()
+        )
+
+        admin_bot = bots["admin"]
+        executor_bot = bots["executor"]  # Используем бот исполнителя, т.к. файл был отправлен именно ему
+
+        admin_caption = (
+            f"❗️ <b>Новое обращение от ИСПОЛНИТЕЛЯ №{new_ticket.id}</b>\n\n"
+            f"<b>От:</b> @{message.from_user.username or message.from_user.full_name} ({message.from_user.id})\n\n"
+            f"<b>Текст обращения:</b>\n{ticket_text}"
+        )
+
+        go_to_ticket_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➡️ Перейти к тикету", callback_data=f"admin_view_ticket:{new_ticket.id}")]
+        ])
+
+        if photo_id:
+            photo_file = await executor_bot.get_file(photo_id)
+            photo_bytes_io = await executor_bot.download_file(photo_file.file_path)
+            photo_bytes = photo_bytes_io.read()
+            photo_to_send = BufferedInputFile(photo_bytes, filename="photo.jpg")
+
+            await admin_bot.send_photo(
+                chat_id=config.admin_id,
+                photo=photo_to_send,
+                caption=admin_caption,
+                reply_markup=go_to_ticket_keyboard
+            )
+        else:
+            await admin_bot.send_message(
+                config.admin_id,
+                admin_caption,
+                reply_markup=go_to_ticket_keyboard
+            )
+
+        user_tickets = await get_user_tickets(session, user_tg_id=message.from_user.id)
+        await message.answer(
+            "Ваши обращения в поддержку:",
+            reply_markup=get_executor_my_tickets_keyboard(user_tickets)
+        )
+    else:
+        await message.answer("Произошла ошибка при создании обращения. Пожалуйста, попробуйте снова.")
+    await state.clear()
+
+
+@router.message(ExecutorSupportStates.waiting_for_ticket_photo, F.photo)
+async def executor_ticket_photo_received(message: types.Message, state: FSMContext, session: AsyncSession, bots: dict, config: Settings):
+    """Принимает фото и завершает создание тикета."""
+    photo_id = message.photo[-1].file_id
+    await finish_executor_ticket_creation(message, state, session, bots, config, photo_id)
+
+@router.message(ExecutorSupportStates.waiting_for_ticket_photo, F.text == "➡️ Пропустить")
+async def executor_ticket_photo_skipped(message: types.Message, state: FSMContext, session: AsyncSession, bots: dict, config: Settings):
+    """Пропускает шаг с фото и завершает создание тикета."""
+    await finish_executor_ticket_creation(message, state, session, bots, config)
+
+@router.callback_query(F.data == "executor_back_to_main_menu")
+async def executor_back_to_main_menu(callback: types.CallbackQuery, state: FSMContext):
+    """Возвращает в главное меню поддержки."""
+    await state.clear()
+    await callback.message.edit_text(
+        "Вы находитесь в разделе поддержки. Чем мы можем помочь?",
+        reply_markup=get_executor_support_menu_keyboard()
+    )
     await callback.answer()

@@ -1,6 +1,6 @@
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder, InlineKeyboardButton
-from app.database.models import OrderStatus, Order
+from app.database.models import OrderStatus, Order, Ticket, TicketStatus
 import urllib.parse
 
 def get_executor_main_keyboard() -> ReplyKeyboardMarkup:
@@ -81,10 +81,12 @@ def get_work_in_progress_keyboard(order: Order) -> InlineKeyboardMarkup:
     builder.adjust(1)
     return builder.as_markup()
 
-def get_new_order_notification_keyboard(order_id: int) -> InlineKeyboardMarkup:
-    """Создает клавиатуру для уведомления о новом заказе."""
+def get_new_order_notification_keyboard(order_id: int, timeout_minutes: int) -> InlineKeyboardMarkup:
+    """Создает клавиатуру для уведомления о новом заказе с указанием времени на ответ."""
     builder = InlineKeyboardBuilder()
-    builder.button(text="➡️ Перейти к заказу", callback_data=f"executor_view_order:{order_id}")
+    # Добавляем информацию о времени в текст кнопки
+    button_text = f"➡️ Перейти к заказу (у вас {timeout_minutes} мин)"
+    builder.button(text=button_text, callback_data=f"executor_view_order:{order_id}")
     return builder.as_markup()
 
 
@@ -146,9 +148,6 @@ def get_balance_orders_keyboard(orders: list[Order]) -> InlineKeyboardMarkup:
             text = f"Заказ №{order.id} от {date_str} - {order.executor_payment} ₽"
             # Для кнопок истории можно не делать callback, либо вести на просмотр заказа
             builder.button(text=text, callback_data=f"executor_view_my_order:{order.id}")
-
-    builder.button(text="⬅️ Назад к балансу", callback_data="back_to_balance")
-    builder.adjust(1)
     return builder.as_markup()
 
 
@@ -193,3 +192,50 @@ def get_order_changes_confirmation_keyboard(order_id: int) -> InlineKeyboardMark
     builder.button(text="❌ Отказаться от заказа", callback_data=f"executor_decline_changes:{order_id}")
     builder.adjust(1)
     return builder.as_markup()
+
+# --- БЛОК: КЛАВИАТУРЫ ДЛЯ РАЗДЕЛА ПОДДЕРЖКИ ИСПОЛНИТЕЛЯ ---
+
+def get_executor_support_menu_keyboard() -> InlineKeyboardMarkup:
+    """Возвращает клавиатуру для главного меню поддержки исполнителя."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➕ Создать новое обращение", callback_data="executor_create_ticket")
+    builder.button(text="📖 Мои обращения", callback_data="executor_my_tickets")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_executor_my_tickets_keyboard(tickets: list[Ticket]) -> InlineKeyboardMarkup:
+    """Создает клавиатуру со списком тикетов исполнителя."""
+    builder = InlineKeyboardBuilder()
+    if tickets:
+        for ticket in tickets:
+            status_text = ticket.status.value
+            theme = ticket.messages[0].text[:20] if ticket.messages else "Без темы"
+            button_text = f"№{ticket.id} - «{theme}...» ({status_text})"
+            builder.button(text=button_text, callback_data=f"executor_view_ticket:{ticket.id}")
+
+    builder.button(text="⬅️ Назад в меню", callback_data="executor_back_to_main_menu")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_executor_view_ticket_keyboard(ticket: Ticket) -> InlineKeyboardMarkup:
+    """Создает клавиатуру для просмотра тикета исполнителем."""
+    builder = InlineKeyboardBuilder()
+
+    if ticket.status != TicketStatus.closed:
+        builder.button(text="💬 Ответить", callback_data=f"executor_reply_ticket:{ticket.id}")
+        builder.button(text="✅ Закрыть обращение", callback_data=f"executor_close_ticket:{ticket.id}")
+
+    builder.button(text="⬅️ Назад к списку", callback_data="executor_my_tickets")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_executor_skip_photo_keyboard() -> ReplyKeyboardMarkup:
+    """Возвращает клавиатуру с кнопкой 'Пропустить' для создания тикета исполнителем."""
+    buttons = [
+        [KeyboardButton(text="➡️ Пропустить")],
+        [KeyboardButton(text="⬅️ Отменить создание тикета")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, one_time_keyboard=True)

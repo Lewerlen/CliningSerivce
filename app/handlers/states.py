@@ -41,3 +41,8 @@ class ExecutorRegistration(StatesGroup):
 
 class ChatStates(StatesGroup):
     in_chat = State()
+
+class ExecutorSupportStates(StatesGroup):
+    creating_ticket_message = State()
+    waiting_for_ticket_photo = State()
+    replying_to_ticket = State()

@@ -1,9 +1,10 @@
 import datetime
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
 from app.database.models import (User, UserRole, Order, OrderItem, OrderStatus, Ticket, TicketMessage, MessageAuthor,
-                                 TicketStatus, UserStatus, ExecutorSchedule, DeclinedOrder)
+                                 TicketStatus, UserStatus, ExecutorSchedule, DeclinedOrder, OrderOffer)
 import random
 import string
 from app.keyboards.executor_kb import WEEKDAYS
@@ -328,46 +329,49 @@ async def update_ticket_status(session: AsyncSession, ticket_id: int, status: Ti
 
 
 async def get_matching_executors(session: AsyncSession, order_date_str: str, order_time_slot: str) -> list[User]:
-    """Возвращает список активных исполнителей, чей график соответствует заказу, либо всех, если у них нет графика."""
-
-    # 1. Определяем день недели заказа
+    """
+    Возвращает список активных исполнителей, отсортированный по приоритету, затем по рейтингу и количеству отзывов,
+    чей график соответствует заказу, либо всех, если у них нет графика.
+    """
     try:
         order_date = datetime.datetime.strptime(order_date_str, "%Y-%m-%d")
-        # weekday() возвращает 0 для пн, 1 для вт и т.д.
         day_of_week_code = list(WEEKDAYS.keys())[order_date.weekday()]
     except (ValueError, IndexError):
-        # Если дата некорректна, возвращаем пустой список
         return []
 
-    # 2. Находим исполнителей с настроенным графиком, который подходит
     schedule_day_column = getattr(ExecutorSchedule, day_of_week_code)
 
+    # 1. Находим исполнителей с подходящим графиком и СОРТИРУЕМ их по новым правилам
     stmt_with_schedule = (
         select(User)
         .join(ExecutorSchedule, User.telegram_id == ExecutorSchedule.executor_tg_id)
         .where(
             User.role == UserRole.executor,
             User.status == UserStatus.active,
-            schedule_day_column.any(order_time_slot)  # Проверяем, есть ли нужный слот в массиве
+            schedule_day_column.any(order_time_slot)
         )
+        .order_by(User.priority.desc(), User.average_rating.desc(), User.review_count.desc()) # <-- ИЗМЕНЕНИЕ ЗДЕСЬ
     )
     result_with_schedule = await session.execute(stmt_with_schedule)
-    executors_with_schedule = list(result_with_schedule.scalars().all())  # <-- Преобразуем в list
+    executors_with_schedule = list(result_with_schedule.scalars().all())
 
-    # 3. Находим исполнителей, у которых график не настроен (доступны всегда)
+    # 2. Находим исполнителей без графика и тоже СОРТИРУЕМ их
     stmt_without_schedule = (
         select(User)
         .outerjoin(ExecutorSchedule, User.telegram_id == ExecutorSchedule.executor_tg_id)
         .where(
             User.role == UserRole.executor,
             User.status == UserStatus.active,
-            ExecutorSchedule.id.is_(None)  # Условие, что графика нет
+            ExecutorSchedule.id.is_(None)
         )
+        .order_by(User.priority.desc(), User.average_rating.desc(), User.review_count.desc()) # <-- И ИЗМЕНЕНИЕ ЗДЕСЬ
     )
     result_without_schedule = await session.execute(stmt_without_schedule)
-    executors_without_schedule = list(result_without_schedule.scalars().all())  # <-- Преобразуем в list
+    executors_without_schedule = list(result_without_schedule.scalars().all())
 
-    # 4. Объединяем и возвращаем
+    # 3. Объединяем два отсортированных списка.
+    # Сначала идут исполнители с подходящим графиком, потом все остальные.
+    # Внутри каждой группы сортировка по приоритету/рейтингу.
     return executors_with_schedule + executors_without_schedule
 
 
@@ -537,3 +541,119 @@ async def add_declined_order(session: AsyncSession, order_id: int, executor_tg_i
     new_decline = DeclinedOrder(order_id=order_id, executor_tg_id=executor_tg_id)
     session.add(new_decline)
     await session.commit()
+
+async def create_order_offer(session: AsyncSession, order_id: int, executor_tg_id: int, expires_at: datetime.datetime) -> OrderOffer:
+    """Создает новое предложение заказа для исполнителя."""
+    new_offer = OrderOffer(
+        order_id=order_id,
+        executor_tg_id=executor_tg_id,
+        expires_at=expires_at,
+        status='active'
+    )
+    session.add(new_offer)
+    await session.commit()
+    return new_offer
+
+async def get_active_offer_for_order(session: AsyncSession, order_id: int) -> OrderOffer | None:
+    """Возвращает активное предложение для конкретного заказа, если оно есть."""
+    result = await session.execute(
+        select(OrderOffer).where(
+            OrderOffer.order_id == order_id,
+            OrderOffer.status == 'active'
+        )
+    )
+    return result.scalar_one_or_none()
+
+async def decline_active_offer(session: AsyncSession, order_id: int, executor_tg_id: int) -> OrderOffer | None:
+    """Находит активное предложение и меняет его статус на 'declined'."""
+    offer = await get_active_offer_for_order(session, order_id)
+    if offer and offer.executor_tg_id == executor_tg_id:
+        offer.status = 'declined'
+        await session.commit()
+        return offer
+    return None
+
+async def add_bonus_to_executor(session: AsyncSession, executor_tg_id: int, amount: float):
+    """Начисляет бонус на бонусный баланс исполнителя."""
+    executor = await get_user(session, executor_tg_id)
+    if executor:
+        executor.bonus_balance += amount
+        # session.commit() здесь не нужен, т.к. он будет вызван в основной функции
+
+
+async def check_and_award_performance_bonus(session: AsyncSession, executor_tg_id: int) -> int | None:
+    """
+    Проверяет, соответствует ли исполнитель критериям для получения бонуса, и начисляет его.
+    Возвращает сумму бонуса, если он был начислен, иначе None.
+    """
+    executor = await get_user(session, executor_tg_id)
+    if not executor:
+        return None
+
+    # --- Критерии для бонуса (можно вынести в конфиг) ---
+    bonus_order_count_step = 10  # Давать бонус за каждые 10 заказов
+    bonus_min_rating = 4.0
+    bonus_amount = 500
+
+    # Проверяем, что у исполнителя достаточно высокий рейтинг
+    if executor.average_rating < bonus_min_rating:
+        return None
+
+    # Считаем количество выполненных заказов с рейтингом
+    stmt = select(func.count(Order.id)).where(
+        Order.executor_tg_id == executor_tg_id,
+        Order.status == OrderStatus.completed,
+        Order.rating.isnot(None)
+    )
+    result = await session.execute(stmt)
+    rated_orders_count = result.scalar_one()
+
+    # Проверяем, достиг ли исполнитель нового порога для бонуса
+    # и что за этот порог бонус еще не был выдан
+    if rated_orders_count >= executor.last_bonus_order_count + bonus_order_count_step:
+        await add_bonus_to_executor(session, executor_tg_id, bonus_amount)
+        executor.last_bonus_order_count += bonus_order_count_step
+        # один commit в конце
+        await session.commit()
+        return bonus_amount
+
+    return None
+
+async def get_order_counts_by_status(session: AsyncSession) -> dict:
+    """Возвращает количество заказов для каждого статуса."""
+    from sqlalchemy import case
+
+    stmt = (
+        select(
+            func.count(case((Order.status == OrderStatus.new, Order.id))).label("new"),
+            func.count(case((Order.status.in_([OrderStatus.accepted, OrderStatus.on_the_way, OrderStatus.in_progress]), Order.id))).label("in_progress"),
+            func.count(case((Order.status == OrderStatus.completed, Order.id))).label("completed"),
+            func.count(case((Order.status == OrderStatus.cancelled, Order.id))).label("cancelled"),
+        )
+    )
+    result = await session.execute(stmt)
+    counts = result.mappings().one()
+    return dict(counts)
+
+async def get_order_details_for_admin(session: AsyncSession, order_id: int) -> Order | None:
+    """
+    Возвращает детали заказа по его ID, подгружая связанные данные
+    о клиенте и исполнителе для панели администратора.
+    """
+    stmt = (
+        select(Order)
+        .options(
+            selectinload(Order.items),  # Загружаем доп. услуги
+            selectinload(Order.executor).load_only(User.name, User.telegram_id, User.phone), # Загружаем только нужные поля Исполнителя
+        )
+        .where(Order.id == order_id)
+    )
+    result = await session.execute(stmt)
+    order = result.scalar_one_or_none()
+
+    # Дополнительно загружаем клиента, так как прямой связи в модели нет
+    if order:
+        client_result = await session.execute(select(User).where(User.telegram_id == order.client_tg_id))
+        order.client = client_result.scalar_one_or_none()
+
+    return order

@@ -52,3 +52,17 @@ def calculate_preliminary_cost(cleaning_type: str, room_count_str: str, bathroom
     total_cost = base_price + extra_rooms_cost + extra_bathrooms_cost
 
     return total_cost
+
+
+def calculate_total_cost(preliminary_cost: int, selected_services: dict) -> int:
+    """
+    Рассчитывает итоговую стоимость, добавляя к предварительной стоимости
+    цену выбранных дополнительных услуг.
+    """
+    additional_cost = 0
+    if selected_services:
+        for service_key, quantity in selected_services.items():
+            price = ADDITIONAL_SERVICE_PRICES.get(service_key, 0)
+            additional_cost += price * quantity
+
+    return preliminary_cost + additional_cost

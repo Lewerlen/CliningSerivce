@@ -2,9 +2,10 @@ import datetime
 from sqlalchemy.future import select
 from aiogram import Bot
 
-from app.database.models import Order, OrderStatus, Ticket, TicketStatus
+from app.database.models import Order, OrderStatus, Ticket, TicketStatus, OrderOffer
 from app.common.texts import RUSSIAN_MONTHS_GENITIVE
 from app.handlers.client import TYUMEN_TZ
+from app.services.db_queries import get_order_by_id, get_matching_executors
 
 
 async def check_and_send_reminders(bots: dict, session_pool, admin_id: int):
@@ -130,5 +131,54 @@ async def check_and_auto_close_tickets(bot: Bot, session_pool):
                 await bot.send_message(chat_id=ticket.user_tg_id, text=text)
             except Exception as e:
                 print(f"Ошибка при автозакрытии тикета {ticket.id}: {e}")
+
+        await session.commit()
+
+
+async def check_expired_offers(bots: dict, session_pool, admin_id: int):
+    """
+    Проверяет истекшие предложения по заказам и передает их следующим исполнителям.
+    """
+    now = datetime.datetime.now()
+    async with session_pool() as session:
+        # Ищем активные предложения, у которых вышло время
+        stmt = select(OrderOffer).where(
+            OrderOffer.status == 'active',
+            OrderOffer.expires_at < now
+        )
+        expired_offers = await session.execute(stmt)
+
+        for offer in expired_offers.scalars().all():
+            offer.status = 'expired'  # Помечаем текущее предложение как истекшее
+
+            order = await get_order_by_id(session, offer.order_id)
+            if not order or order.status != OrderStatus.new:
+                continue  # Если заказ уже приняли или отменили, ничего не делаем
+
+            # Получаем полный список подходящих исполнителей (он уже отсортирован)
+            all_executors = await get_matching_executors(
+                session, order.selected_date, order.selected_time
+            )
+
+            # Находим, каким по счету был исполнитель, чей оффер истек
+            current_executor_index = -1
+            for i, executor in enumerate(all_executors):
+                if executor.telegram_id == offer.executor_tg_id:
+                    current_executor_index = i
+                    break
+
+            # Ищем следующего исполнителя
+            if current_executor_index != -1 and current_executor_index + 1 < len(all_executors):
+                next_executor = all_executors[current_executor_index + 1]
+                # Рекурсивно вызываем функцию, чтобы отправить предложение следующему
+                from app.handlers.client import offer_order_to_executor  # Локальный импорт
+                await offer_order_to_executor(session, bots, order, next_executor)
+            else:
+                # Если следующий не найден (очередь закончилась)
+                await bots["admin"].send_message(
+                    admin_id,
+                    f"❗️<b>Никто не принял заказ №{order.id} вовремя.</b>\n"
+                    "Очередь исполнителей закончилась. Рекомендуется ручное назначение."
+                )
 
         await session.commit()

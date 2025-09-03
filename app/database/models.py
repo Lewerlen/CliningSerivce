@@ -37,6 +37,9 @@ class User(Base):
     review_count = Column(Integer, default=0)
     consecutive_declines = Column(Integer, default=0, nullable=False)
     blocked_until = Column(DateTime, nullable=True)  # Время окончания блокировки
+    bonus_balance = Column(Float, default=0.0, nullable=False)
+    last_bonus_order_count = Column(Integer, default=0, nullable=False)
+    priority = Column(Integer, default=0, nullable=False)  # Чем выше число, тем выше приоритет
 
 class ServiceType(enum.Enum):
     base = "base"
@@ -182,3 +185,17 @@ class DeclinedOrder(Base):
     id = Column(Integer, primary_key=True)
     order_id = Column(Integer, ForeignKey('orders.id'), nullable=False)
     executor_tg_id = Column(BigInteger, ForeignKey('users.telegram_id'), nullable=False)
+
+class OrderOffer(Base):
+    __tablename__ = 'order_offers'
+
+    id = Column(Integer, primary_key=True)
+    order_id = Column(Integer, ForeignKey('orders.id'), nullable=False)
+    executor_tg_id = Column(BigInteger, ForeignKey('users.telegram_id'), nullable=False)
+    # Время, до которого исполнитель должен ответить
+    expires_at = Column(DateTime, nullable=False)
+    # Статус предложения: active, accepted, expired, declined
+    status = Column(String, default='active', nullable=False)
+
+    order = relationship("Order")
+    executor = relationship("User")
