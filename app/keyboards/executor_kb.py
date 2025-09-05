@@ -25,7 +25,8 @@ def get_new_orders_keyboard(orders: list) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     if orders:
         for order in orders:
-            text = f"Заказ №{order.id} от {order.created_at.strftime('%d.%m')} - {order.total_price} ₽"
+            test_label = " (ТЕСТ)" if order.is_test else ""
+            text = f"Заказ №{order.id}{test_label} от {order.created_at.strftime('%d.%m')} - {order.total_price} ₽"
             builder.button(text=text, callback_data=f"executor_view_order:{order.id}")
     builder.adjust(1)
     return builder.as_markup()
@@ -50,7 +51,8 @@ def get_my_orders_keyboard(orders: list) -> InlineKeyboardMarkup:
             else:  # accepted
                 status_icon = "✅"
 
-            text = f"{status_icon} Заказ №{order.id} от {order.created_at.strftime('%d.%m')} - {order.total_price} ₽"
+            test_label = " (ТЕСТ)" if order.is_test else ""
+            text = f"{status_icon} Заказ №{order.id}{test_label} от {order.created_at.strftime('%d.%m')} - {order.total_price} ₽"
             builder.button(text=text, callback_data=f"executor_view_my_order:{order.id}")
     builder.adjust(1)
     return builder.as_markup()

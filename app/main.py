@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 from typing import Callable, Dict, Any, Awaitable
+import json
 
 from aiogram import Bot, Dispatcher, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
@@ -10,11 +11,13 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from app.config import load_config
+from app.config import load_config, System
 from app.handlers import admin, client, executor
 from app.database.models import Base
 from app.scheduler import check_and_send_reminders, check_and_auto_close_tickets, check_expired_offers
-from app.middlewares.album_middleware import AlbumMiddleware
+from app.services.db_queries import get_system_settings, update_system_settings
+from app.services.price_calculator import TARIFFS
+
 
 class DbSessionMiddleware(BaseMiddleware):
     def __init__(self, session_pool: sessionmaker):
@@ -71,6 +74,53 @@ async def main():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+    # --- БЛОК ЗАГРУЗКИ СИСТЕМНЫХ НАСТРОЕК ПРИ СТАРТЕ ---
+    async with session_maker() as session:
+        system_settings = await get_system_settings(session)
+        if not system_settings:
+            # Если настроек в БД нет, создаем их со значениями по умолчанию из модели
+            system_settings = await update_system_settings(session, {})
+
+        # Десериализуем JSON-строки в словари
+        try:
+            tariffs_dict = json.loads(system_settings.tariffs) if isinstance(system_settings.tariffs,
+                                                                             str) else system_settings.tariffs or {}
+        except (json.JSONDecodeError, TypeError):
+            tariffs_dict = {}
+
+            # Если в базе нет тарифов, загружаем их из файла-константы
+        if not tariffs_dict:
+            tariffs_dict = TARIFFS
+            await update_system_settings(session, {"tariffs": json.dumps(tariffs_dict, ensure_ascii=False)})
+            system_settings.tariffs = json.dumps(tariffs_dict, ensure_ascii=False)
+
+        try:
+            services_dict = json.loads(system_settings.additional_services) if isinstance(
+                system_settings.additional_services, str) else system_settings.additional_services or {}
+        except (json.JSONDecodeError, TypeError):
+            services_dict = {}
+
+            # Если в базе нет доп. услуг, загружаем их из файла-константы
+        if not services_dict:
+            from app.common.texts import ADDITIONAL_SERVICES
+            services_dict = ADDITIONAL_SERVICES
+            await update_system_settings(session,
+                                         {"additional_services": json.dumps(services_dict, ensure_ascii=False)})
+            # Обновляем локальную переменную, чтобы не перезапрашивать из БД
+            system_settings.additional_services = json.dumps(services_dict, ensure_ascii=False)
+
+            # Заполняем объект config.system данными из БД
+        config.system = System(
+            commission_type=system_settings.commission_type,
+            commission_value=system_settings.commission_value,
+            test_mode_enabled=system_settings.test_mode_enabled,
+            show_commission_to_executor=system_settings.show_commission_to_executor,
+            tariffs=tariffs_dict,
+            additional_services=services_dict
+        )
+    # --- КОНЕЦ БЛОКА ЗАГРУЗКИ ---
+
+
     client_bot = Bot(token=config.bots.client_bot_token, default=DefaultBotProperties(parse_mode="HTML"))
     executor_bot = Bot(token=config.bots.executor_bot_token, default=DefaultBotProperties(parse_mode="HTML"))
     admin_bot = Bot(token=config.bots.admin_bot_token, default=DefaultBotProperties(parse_mode="HTML"))
@@ -113,7 +163,7 @@ async def main():
         check_expired_offers,
         trigger="interval",
         seconds=30,  # Проверяем каждые 30 секунд
-        kwargs={"bots": bots, "session_pool": session_maker, "admin_id": config.admin_id}
+        kwargs={"bots": bots, "session_pool": session_maker, "admin_id": config.admin_id, "config": config}
     )
     scheduler.start()
 

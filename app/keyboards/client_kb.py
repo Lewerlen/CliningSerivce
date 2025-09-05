@@ -2,7 +2,7 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMar
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 import calendar
 from datetime import datetime
-from app.common.texts import STATUS_MAPPING
+from app.common.texts import STATUS_MAPPING, ADDITIONAL_SERVICES
 from app.database.models import Ticket, TicketStatus, Order, OrderStatus
 
 
@@ -82,7 +82,8 @@ def get_active_orders_keyboard(orders: list) -> InlineKeyboardMarkup:
     """Создает клавиатуру со списком активных заказов и кнопкой архива."""
     builder = InlineKeyboardBuilder()
     for order in orders:
-        text = f"Заказ №{order.id} от {order.created_at.strftime('%d.%m.%Y')} - {order.total_price} ₽"
+        test_label = " (ТЕСТ)" if order.is_test else ""
+        text = f"Заказ №{order.id}{test_label} от {order.created_at.strftime('%d.%m.%Y')} - {order.total_price} ₽"
         builder.button(text=text, callback_data=f"view_order:{order.id}")
 
     builder.button(text="🗂 Архив заказов", callback_data="view_archive")
@@ -110,7 +111,8 @@ def get_archive_orders_keyboard(orders: list) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for order in orders:
         status_text = STATUS_MAPPING.get(order.status, order.status.value)
-        text = f"Заказ №{order.id} от {order.created_at.strftime('%d.%m.%Y')} - {status_text}"
+        test_label = " (ТЕСТ)" if order.is_test else ""
+        text = f"Заказ №{order.id}{test_label} от {order.created_at.strftime('%d.%m.%Y')} - {status_text}"
         builder.button(text=text, callback_data=f"view_archive_order:{order.id}")
 
     builder.button(text="⬅️ Назад к активным заказам", callback_data="back_to_orders_list")
@@ -160,24 +162,6 @@ def get_bathroom_count_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="⬅️ Назад")]
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
-
-
-# Словарь с дополнительными услугами и их ценами из ТЗ
-ADDITIONAL_SERVICES = {
-    "win": "🪞 Мойка окон (+300 ₽/шт)",
-    "sofa": "🛋 Химчистка дивана (+1500 ₽)",
-    "chair": "🪑 Химчистка стульев (+300 ₽/шт)",
-    "plumbing": "🚿 Чистка сантехники (+500 ₽)",
-    "bedding": "🛏 Замена постельного белья (+200 ₽)",
-    "kitchen": "🧴 Мытье кухонной техники (+600 ₽)",
-    "cabinets": "🧼 Чистка шкафчиков внутри (+500₽)",
-    "balcony": "🧯 Уборка балкона (+700 ₽)",
-    "carpet": "🧹 Чистка ковров (+800 ₽)",
-    "pets": "🐾 Удаление шерсти животных (+400 ₽)",
-    "fridge": "❄ Мойка холодильника (+700 ₽)",
-    "stove": "🍳 Мойка плиты (+500 ₽)",
-    "oven": "🔥 Мойка духовки (+700 ₽)",
-}
 
 
 def get_additional_services_keyboard(selected_services: dict = None) -> InlineKeyboardMarkup:

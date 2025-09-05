@@ -1,20 +1,21 @@
 import datetime
 import logging
 from contextlib import suppress
-from typing import List
 from zoneinfo import ZoneInfo
 from aiogram import F, Router, types, Bot
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile, InputMediaPhoto
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.services.db_queries import get_matching_executors
+from app.services.db_queries import get_matching_executors, get_users_by_role
 from app.config import Settings
 from app.handlers.states import OrderStates, SupportStates, RatingStates, ChatStates
 from app.keyboards.executor_kb import get_new_order_notification_keyboard, get_order_changes_confirmation_keyboard
+from app.common.texts import ADDITIONAL_SERVICES
+from app.keyboards.admin_kb import get_new_order_admin_keyboard
 from app.keyboards.client_kb import (
-    ADDITIONAL_SERVICES, get_exit_chat_keyboard,
+    get_exit_chat_keyboard,
     get_support_menu_keyboard, get_reply_to_chat_keyboard,
     create_calendar,
     get_active_orders_keyboard,
@@ -56,10 +57,10 @@ from app.services.db_queries import (
     get_user_tickets,
     add_message_to_ticket,
     update_ticket_status,
-    save_order_rating, update_executor_rating, update_user_phone, create_order_offer
+    save_order_rating, update_executor_rating, update_user_phone, create_order_offer, check_and_award_performance_bonus
 )
-from app.database.models import MessageAuthor, TicketStatus, User, Order
-from app.services.price_calculator import ADDITIONAL_SERVICE_PRICES, calculate_preliminary_cost, calculate_total_cost
+from app.database.models import MessageAuthor, TicketStatus, User, Order, UserRole
+from app.services.price_calculator import ADDITIONAL_SERVICE_PRICES, calculate_preliminary_cost, calculate_total_cost, calculate_executor_payment
 from app.services.yandex_maps_api import get_address_from_coords, get_address_from_text
 from app.common.texts import STATUS_MAPPING, RUSSIAN_MONTHS_GENITIVE
 
@@ -84,8 +85,8 @@ async def cmd_start(message: types.Message, session: AsyncSession, state: FSMCon
         await create_user(
             session,
             telegram_id=message.from_user.id,
-            name=message.from_user.full_name
-            # Телефон не передаем
+            name=message.from_user.full_name,
+            username=message.from_user.username
         )
         await message.answer(
             f"Здравствуйте, {message.from_user.full_name}! Рады видеть вас в нашем сервисе.",
@@ -175,7 +176,9 @@ async def my_orders(message: types.Message, session: AsyncSession, state: FSMCon
     await state.clear()  # На всякий случай сбрасываем состояние
 
     orders = await get_user_orders(session, client_tg_id=message.from_user.id)
-    active_orders = [o for o in orders if o.status in (OrderStatus.new, OrderStatus.accepted, OrderStatus.in_progress, OrderStatus.pending_confirmation)]
+    active_orders = [o for o in orders if o.status in (
+    OrderStatus.new, OrderStatus.accepted, OrderStatus.on_the_way, OrderStatus.in_progress,
+    OrderStatus.pending_confirmation)]
 
     if not active_orders:
         await message.answer(
@@ -244,8 +247,9 @@ async def view_order(callback: types.CallbackQuery, session: AsyncSession):
         formatted_date = order.selected_date
 
     # Формируем текст
+    test_label = " (ТЕСТ)" if order.is_test else ""
     order_details = (
-        f"<b>Детали заказа №{order.id}</b>\n\n"
+        f"<b>Детали заказа №{order.id}{test_label}</b>\n\n"
         f"<b>Статус:</b> <i>{STATUS_MAPPING.get(order.status, order.status.value)}</i>\n"
         f"<b>Тип уборки:</b> {order.cleaning_type}\n"
         f"<b>Комнат:</b> {order.room_count}, <b>Санузлов:</b> {order.bathroom_count}\n\n"
@@ -327,8 +331,9 @@ async def view_archive_order(callback: types.CallbackQuery, session: AsyncSessio
     except (ValueError, KeyError, TypeError):
         formatted_date = order.selected_date
 
+    test_label = " (ТЕСТ)" if order.is_test else ""
     order_details = (
-        f"<b>Детали заказа №{order.id} (Архив)</b>\n\n"
+        f"<b>Детали заказа №{order.id}{test_label} (Архив)</b>\n\n"
         f"<b>Статус:</b> <i>{STATUS_MAPPING.get(order.status, order.status.value)}</i>\n"
     f"<b>Тип уборки:</b> {order.cleaning_type}\n"
 
@@ -1294,38 +1299,61 @@ async def handle_payment_cash(message: types.Message, state: FSMContext, session
     Обрабатывает оплату наличными, сохраняет заказ и запускает процесс поиска исполнителя.
     """
     user_data = await state.get_data()
-    new_order = await create_order(session, user_data, client_tg_id=message.from_user.id)
+    # Проверяем, включен ли тестовый режим
+    is_test_order = config.system.test_mode_enabled
+    new_order = await create_order(session, user_data, client_tg_id=message.from_user.id, is_test=is_test_order)
+
     await message.answer(
         "Спасибо! Ваш заказ принят в работу. Мы начали поиск исполнителя и скоро уведомим вас.",
         reply_markup=get_main_menu_keyboard()
     )
-
-    # Уведомляем админа о новом заказе
-    # (здесь остается ваш код для уведомления админа, я его сократил для краткости)
-    summary_text_admin = f"✅ <b>Новый заказ! №{new_order.id}</b>..."
-    await bots["admin"].send_message(chat_id=config.admin_id, text=summary_text_admin)
-
-    # --- НОВАЯ ЛОГИКА ОЧЕРЕДИ ---
-    executors = await get_matching_executors(
-        session, new_order.selected_date, new_order.selected_time
-    )
-
-    if executors:
-        # Берем первого исполнителя из отсортированного списка
-        next_executor = executors[0]
-
-        # Запускаем процесс предложения заказа (эта функция будет создана ниже)
-        await offer_order_to_executor(session, bots, new_order, next_executor)
-    else:
-        await bots["admin"].send_message(
-            config.admin_id,
-            f"❗️<b>Внимание!</b> На новый заказ №{new_order.id} не найдено подходящих исполнителей."
-        )
-
     await state.clear()
 
+    admin_ids_to_notify = {config.admin_id}
+    db_admins = await get_users_by_role(session, UserRole.admin)
+    for admin in db_admins:
+        admin_ids_to_notify.add(admin.telegram_id)
 
-async def offer_order_to_executor(session: AsyncSession, bots: dict, order: Order, executor: User):
+    if admin_ids_to_notify:
+        test_label = " (ТЕСТОВЫЙ)" if new_order.is_test else ""
+        notification_text = (
+            f"✅ <b>Новый заказ! №{new_order.id}{test_label}</b>\n\n"
+            f"<b>Тип уборки:</b> {new_order.cleaning_type}\n"
+            f"<b>Состав:</b> {new_order.room_count} ком., {new_order.bathroom_count} с/у\n"
+            f"<b>Адрес:</b> {new_order.address_text}\n"
+            f"<b>Дата и время:</b> {new_order.selected_date} {new_order.selected_time}\n"
+            f"<b>Сумма:</b> {new_order.total_price} ₽\n\n"
+            f"Заказ ожидает назначения исполнителя."
+        )
+        keyboard = get_new_order_admin_keyboard(new_order.id)
+        for admin_id in admin_ids_to_notify:
+            try:
+                await bots["admin"].send_message(
+                    chat_id=admin_id,
+                    text=notification_text,
+                    reply_markup=keyboard
+                )
+            except Exception as e:
+                logging.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
+
+    await find_and_notify_executors(session, new_order.id, bots["executor"], config)
+
+async def find_and_notify_executors(session: AsyncSession, order_id: int, executor_bot: Bot, config: Settings):
+    """Находит подходящих исполнителей и предлагает заказ первому в очереди."""
+    order = await get_order_by_id(session, order_id)
+    if not order:
+        logging.error(f"Не удалось найти заказ №{order_id} для поиска исполнителя.")
+        return
+
+    executors = await get_matching_executors(session, order.selected_date, order.selected_time)
+
+    if executors:
+        next_executor = executors[0]
+        await offer_order_to_executor(session, {"executor": executor_bot}, order, next_executor, config)
+    else:
+        logging.warning(f"На новый заказ №{order_id} не найдено подходящих исполнителей.")
+
+async def offer_order_to_executor(session: AsyncSession, bots: dict, order: Order, executor: User, config: Settings):
     """Отправляет предложение одному исполнителю и создает запись в OrderOffer."""
     now = datetime.datetime.now(TYUMEN_TZ)
     order_start_time = datetime.datetime.strptime(
@@ -1343,19 +1371,27 @@ async def offer_order_to_executor(session: AsyncSession, bots: dict, order: Orde
         timeout_minutes = 60
 
     expires_at = now + datetime.timedelta(minutes=timeout_minutes)
-
-    # Убираем информацию о таймзоне перед записью в БД
     naive_expires_at = expires_at.replace(tzinfo=None)
 
-    # Создаем предложение в БД с "наивным" временем
     await create_order_offer(session, order.id, executor.telegram_id, naive_expires_at)
 
-    # Уведомляем исполнителя
-    executor_payment = round(order.total_price * 0.85)
+    executor_payment = calculate_executor_payment(
+        total_price=order.total_price,
+        commission_type=config.system.commission_type,
+        commission_value=config.system.commission_value
+    )
+
+    financial_line = ""
+    if config.system.show_commission_to_executor:
+        financial_line = f"💰 <b>Ваша выплата:</b> {executor_payment} ₽"
+    else:
+        financial_line = f"💰 <b>Вознаграждение:</b> {executor_payment} ₽"
+
+    test_label = " (ТЕСТОВЫЙ)" if order.is_test else ""
     notification_text = (
-        f"🔥 <b>Новый заказ №{order.id}</b>\n\n"
+        f"🔥 <b>Новый заказ №{order.id}{test_label}</b>\n\n"
         f"<b>Дата и время:</b> {order.selected_date}, {order.selected_time}\n"
-        f"💰 <b>Ваша выплата:</b> {executor_payment} ₽\n\n"
+        f"{financial_line}\n\n"
         f"<i>У вас есть {timeout_minutes} минут, чтобы принять решение.</i>"
     )
     notification_keyboard = get_new_order_notification_keyboard(order.id, timeout_minutes)
@@ -1768,15 +1804,25 @@ async def handle_review(message: types.Message, state: FSMContext, session: Asyn
     # 3. Уведомляем исполнителя о новой оценке
     try:
         executor_bot = bots.get("executor")
+        review_notification_text = (
+            f"🎉 Поздравляем! Вы получили новый отзыв по заказу №{order.id}.\n\n"
+            f"<b>Оценка:</b> {'⭐' * rating}\n"
+            f"<b>Отзыв клиента:</b> {review_text}\n\n"
+            "Ваш общий рейтинг был обновлен."
+        )
         await executor_bot.send_message(
             chat_id=order.executor_tg_id,
-            text=(
-                f"🎉 Поздравляем! Вы получили новый отзыв по заказу №{order_id}.\n\n"
-                f"<b>Оценка:</b> {'⭐' * rating}\n"
-                f"<b>Отзыв клиента:</b> {review_text}\n\n"
-                "Ваш общий рейтинг был обновлен."
-            )
+            text=review_notification_text
         )
+
+        # 4. Проверяем и начисляем бонус за производительность
+        bonus_amount = await check_and_award_performance_bonus(session, order.executor_tg_id)
+        if bonus_amount:
+            await executor_bot.send_message(
+                chat_id=order.executor_tg_id,
+                text=f"💰 Поздравляем! Вам начислен бонус в размере {bonus_amount} ₽ за отличную работу!"
+            )
+
     except Exception as e:
         logging.error(f"Не удалось отправить уведомление об оценке исполнителю {order.executor_tg_id}: {e}")
 
@@ -1787,26 +1833,49 @@ async def handle_review(message: types.Message, state: FSMContext, session: Asyn
 # --- БЛОК: ЧАТ С ИСПОЛНИТЕЛЕМ ---
 
 @router.callback_query(F.data.startswith("start_chat:"))
-async def start_chat_with_executor(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession):
-    """Начинает чат с исполнителем по конкретному заказу."""
+async def start_chat_handler(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession, config: Settings):
+    """
+    Начинает чат с исполнителем или администратором в зависимости от контекста.
+    """
     order_id = int(callback.data.split(":")[1])
     order = await get_order_by_id(session, order_id)
 
-    if not order or not order.executor_tg_id:
-        await callback.answer("Не удалось найти исполнителя по этому заказу.", show_alert=True)
+    if not order:
+        await callback.answer("Не удалось найти заказ.", show_alert=True)
+        return
+
+    # Определяем, с кем будет чат, по тексту исходного сообщения
+    original_message_text = callback.message.text or callback.message.caption or ""
+    partner_id = None
+    partner_role = None
+    welcome_text = ""
+
+    # Если в сообщении есть упоминание администратора/поддержки, значит, это ответ админу
+    if "[Администратор" in original_message_text or "[Поддержка" in original_message_text:
+        partner_id = config.admin_id
+        partner_role = "admin"
+        welcome_text = f"Вы вошли в чат с администратором по заказу №{order.id}.\n" \
+                       "Все сообщения будут пересланы. Для выхода нажмите кнопку."
+    # В противном случае, это чат с исполнителем
+    elif order.executor_tg_id:
+        partner_id = order.executor_tg_id
+        partner_role = "executor"
+        welcome_text = f"Вы вошли в чат с исполнителем по заказу №{order.id}.\n" \
+                       "Все сообщения, которые вы сюда отправите, будут пересланы ему. " \
+                       "Чтобы выйти, нажмите кнопку ниже."
+    else:
+        await callback.answer("Не удалось определить получателя чата.", show_alert=True)
         return
 
     await state.set_state(ChatStates.in_chat)
-    await state.update_data(chat_partner_id=order.executor_tg_id, order_id=order.id)
-
-    await callback.message.answer(
-        f"Вы вошли в чат с исполнителем по заказу №{order.id}.\n"
-        "Все сообщения, которые вы сюда отправите, будут пересланы ему. "
-        "Чтобы выйти, нажмите кнопку ниже.",
-        reply_markup=get_exit_chat_keyboard()
+    await state.update_data(
+        chat_partner_id=partner_id,
+        partner_role=partner_role,  # Сохраняем роль партнера
+        order_id=order.id
     )
-    await callback.answer()
 
+    await callback.message.answer(welcome_text, reply_markup=get_exit_chat_keyboard())
+    await callback.answer()
 
 @router.message(ChatStates.in_chat, F.text == "⬅️ Выйти из чата")
 async def exit_chat_client(message: types.Message, state: FSMContext):
@@ -1817,15 +1886,22 @@ async def exit_chat_client(message: types.Message, state: FSMContext):
         reply_markup=get_main_menu_keyboard()
     )
 
-
 @router.message(ChatStates.in_chat)
-async def forward_message_to_executor(message: types.Message, state: FSMContext, bots: dict):
-    """Пересылает сообщение от клиента исполнителю."""
+async def forward_message_from_client(message: types.Message, state: FSMContext, bots: dict):
+    """Пересылает сообщение от клиента админу или исполнителю в зависимости от состояния."""
     user_data = await state.get_data()
     partner_id = user_data.get("chat_partner_id")
     order_id = user_data.get("order_id")
+    partner_role = user_data.get("partner_role") # Получаем роль из состояния
 
-    if not partner_id:
+    if not all([partner_id, order_id, partner_role]):
+        await message.answer("Ошибка чата. Попробуйте начать заново.")
+        return
+
+    # Динамически выбираем нужного бота для отправки
+    target_bot = bots.get(partner_role)
+    if not target_bot:
+        await message.answer(f"Ошибка конфигурации: бот для роли '{partner_role}' не найден.")
         return
 
     # Если пользователь пытается отправить альбом, вежливо просим этого не делать
@@ -1833,29 +1909,31 @@ async def forward_message_to_executor(message: types.Message, state: FSMContext,
         await message.answer("Пожалуйста, отправляйте фотографии по одной за раз.")
         return
 
-    executor_bot = bots.get("executor")
     prefix = f"💬 <b>[Клиент | Заказ №{order_id}]:</b>\n"
-    reply_keyboard = get_reply_to_chat_keyboard(order_id)
+    # Если сообщение адресовано админу, кнопка "Ответить" ему не нужна
+    reply_keyboard = get_reply_to_chat_keyboard(order_id) if partner_role != "admin" else None
 
     try:
         if message.text:
-            await executor_bot.send_message(partner_id, f"{prefix}{message.text}", reply_markup=reply_keyboard)
+            await target_bot.send_message(partner_id, f"{prefix}{message.text}", reply_markup=reply_keyboard)
         elif message.photo:
+            # Используем универсальный метод скачивания и отправки, как в других чатах
             photo_file = await message.bot.get_file(message.photo[-1].file_id)
             photo_bytes_io = await message.bot.download_file(photo_file.file_path)
             photo_to_send = BufferedInputFile(photo_bytes_io.read(), filename="photo.jpg")
 
-            await executor_bot.send_photo(
+            await target_bot.send_photo(
                 chat_id=partner_id,
                 photo=photo_to_send,
                 caption=f"{prefix}{message.caption or ''}",
                 reply_markup=reply_keyboard
             )
-
         await message.answer("✅ Ваше сообщение отправлено.")
 
     except Exception as e:
-        logging.error(f"Ошибка пересылки сообщения исполнителю {partner_id}: {e}")
+        logging.error(f"Ошибка пересылки сообщения к {partner_role} {partner_id}: {e}")
         await message.answer("Не удалось доставить сообщение. Попробуйте позже.")
+
+
 
 # --- КОНЕЦ БЛОКА ---

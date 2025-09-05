@@ -4,9 +4,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
 from app.database.models import (User, UserRole, Order, OrderItem, OrderStatus, Ticket, TicketMessage, MessageAuthor,
-                                 TicketStatus, UserStatus, ExecutorSchedule, DeclinedOrder, OrderOffer)
+                                 TicketStatus, UserStatus, ExecutorSchedule, DeclinedOrder, OrderOffer, OrderLog,
+                                 SystemSettings)
 import random
 import string
+from app.common.texts import STATUS_MAPPING
 from app.keyboards.executor_kb import WEEKDAYS
 
 async def get_user(session: AsyncSession, telegram_id: int) -> User | None:
@@ -14,11 +16,12 @@ async def get_user(session: AsyncSession, telegram_id: int) -> User | None:
     result = await session.execute(select(User).where(User.telegram_id == telegram_id))
     return result.scalar_one_or_none()
 
-async def create_user(session: AsyncSession, telegram_id: int, name: str, phone: str | None = None, role: UserRole = UserRole.client) -> User:
+async def create_user(session: AsyncSession, telegram_id: int, name: str, username: str | None, phone: str | None = None, role: UserRole = UserRole.client) -> User:
     """Создает и возвращает нового пользователя."""
     new_user = User(
         telegram_id=telegram_id,
         name=name,
+        username=username,
         phone=phone,
         role=role
     )
@@ -26,7 +29,14 @@ async def create_user(session: AsyncSession, telegram_id: int, name: str, phone:
     await session.commit()
     return new_user
 
-async def register_executor(session: AsyncSession, telegram_id: int, name: str, phone: str, referred_by: int | None = None) -> User:
+async def get_users_by_role(session: AsyncSession, role: UserRole) -> list[User]:
+    """Возвращает список пользователей по их роли."""
+    result = await session.execute(
+        select(User).where(User.role == role)
+    )
+    return result.scalars().all()
+
+async def register_executor(session: AsyncSession, telegram_id: int, name: str, username: str | None, phone: str, referred_by: int | None = None) -> User:
     """Регистрирует пользователя как исполнителя, обновляет его роль и присваивает реферальный код."""
     user = await get_user(session, telegram_id)
     is_new_referral = False
@@ -34,6 +44,8 @@ async def register_executor(session: AsyncSession, telegram_id: int, name: str, 
     if user:
         # Если пользователь уже есть (например, был клиентом), обновляем его данные
         user.role = UserRole.executor
+        user.name = name
+        user.username = username
         user.phone = phone
         user.status = UserStatus.active
         if not user.referral_code: # Генерируем код, только если его еще нет
@@ -46,6 +58,7 @@ async def register_executor(session: AsyncSession, telegram_id: int, name: str, 
         user = User(
             telegram_id=telegram_id,
             name=name,
+            username=username,
             phone=phone,
             role=UserRole.executor,
             status=UserStatus.active,
@@ -65,8 +78,8 @@ async def register_executor(session: AsyncSession, telegram_id: int, name: str, 
     await session.commit()
     return user
 
-async def create_order(session: AsyncSession, data: dict, client_tg_id: int):
-    """Создает заказ и связанные с ним доп. услуги в базе данных."""
+async def create_order(session: AsyncSession, data: dict, client_tg_id: int, is_test: bool = False):
+    """Создает заказ, связанные с ним доп. услуги и первую запись в логе."""
 
     # Создаем основной заказ
     new_order = Order(
@@ -82,10 +95,17 @@ async def create_order(session: AsyncSession, data: dict, client_tg_id: int):
         order_name=data.get("order_name"),
         order_phone=data.get("order_phone"),
         photo_file_ids=data.get("photo_ids"),
-        total_price=data.get("total_cost")
+        total_price=data.get("total_cost"),
+        is_test=is_test
     )
     session.add(new_order)
     await session.flush()  # Получаем id заказа для связи
+
+    # Добавляем первую запись в лог
+    log_message = "✅ Заказ создан клиентом"
+    if is_test:
+        log_message += " (ТЕСТОВЫЙ РЕЖИM)"
+    session.add(OrderLog(order_id=new_order.id, message=log_message))
 
     # Создаем записи для доп. услуг
     selected_services = data.get("selected_services", {})
@@ -105,10 +125,11 @@ async def get_user_orders(session: AsyncSession, client_tg_id: int):
 
 
 async def update_order_status(session: AsyncSession, order_id: int, status: OrderStatus):
-    """Обновляет статус заказа."""
+    """Обновляет статус заказа и добавляет запись в лог."""
     order = await session.get(Order, order_id)
     if order:
         order.status = status
+        session.add(OrderLog(order_id=order.id, message=f"Статус изменен на '{STATUS_MAPPING.get(status, status.value)}'"))
         await session.commit()
         return order
     return None
@@ -119,16 +140,6 @@ async def get_order_by_id(session: AsyncSession, order_id: int):
         select(Order).options(selectinload(Order.items)).where(Order.id == order_id)
     )
     return result.scalar_one_or_none()
-
-async def update_order_datetime(session: AsyncSession, order_id: int, new_date: str, new_time: str):
-    """Обновляет дату и время заказа."""
-    order = await session.get(Order, order_id)
-    if order:
-        order.selected_date = new_date
-        order.selected_time = new_time
-        await session.commit()
-        return order
-    return None
 
 async def get_orders_by_status(session: AsyncSession, status: OrderStatus, executor_tg_id: int = None) -> list[Order]:
     """
@@ -152,12 +163,15 @@ async def get_orders_by_status(session: AsyncSession, status: OrderStatus, execu
     return result.scalars().all()
 
 async def assign_executor_to_order(session: AsyncSession, order_id: int, executor_tg_id: int, payment_amount: float) -> Order | None:
-    """Назначает исполнителя на заказ, обновляет статус и сумму выплаты."""
+    """Назначает исполнителя на заказ, обновляет статус, сумму выплаты и добавляет лог."""
     order = await session.get(Order, order_id)
     if order and order.status == OrderStatus.new:
         order.executor_tg_id = executor_tg_id
         order.status = OrderStatus.accepted
         order.executor_payment = payment_amount
+
+        session.add(OrderLog(order_id=order.id, message="✅ Исполнитель назначен"))
+
         await session.commit()
         return order
     return None
@@ -194,46 +208,69 @@ async def get_executor_active_orders(session: AsyncSession, executor_tg_id: int)
     )
     return result.scalars().all()
 
-async def update_order_services_and_price(session: AsyncSession, order_id: int, new_services: set,
-                                          new_total_price: float):
+async def update_order_services_and_price(session: AsyncSession, order_id: int, new_services: dict,
+                                          new_total_price: float, admin_id: int, admin_username: str) -> Order | None:
     """Обновляет доп. услуги и итоговую стоимость заказа."""
     order = await get_order_by_id(session, order_id)
     if not order:
         return None
 
-    # Удаляем старые услуги, связанные с этим заказом
+    # Удаляем старые услуги
     for item in order.items:
         await session.delete(item)
+    await session.flush()  # Применяем удаление
 
     # Добавляем новые услуги
-    for service_key in new_services:
-        order_item = OrderItem(order_id=order.id, service_key=service_key)
+    for service_key, quantity in new_services.items():
+        order_item = OrderItem(order_id=order.id, service_key=service_key, quantity=quantity)
         session.add(order_item)
 
     # Обновляем цену
     order.total_price = new_total_price
 
+    # Добавляем лог
+    log_message = f"📝 Администратор @{admin_username} изменил доп. услуги. Новая цена: {new_total_price} ₽"
+    session.add(OrderLog(order_id=order_id, message=log_message, admin_id=admin_id))
+
     await session.commit()
     return order
 
-async def update_order_address(session: AsyncSession, order_id: int, new_address: str, new_lat: float | None, new_lon: float | None):
+
+async def update_order_datetime(session: AsyncSession, order_id: int, new_date: str, new_time: str, admin_id: int, admin_username: str) -> Order | None:
+    """Обновляет дату и время заказа."""
+    order = await session.get(Order, order_id)
+    if order:
+        order.selected_date = new_date
+        order.selected_time = new_time
+        log_message = f"📅 Администратор @{admin_username} изменил дату на {new_date} и время на {new_time}"
+        session.add(OrderLog(order_id=order_id, message=log_message, admin_id=admin_id))
+        await session.commit()
+        return order
+    return None
+
+
+async def update_order_address(session: AsyncSession, order_id: int, new_address: str, new_lat: float | None, new_lon: float | None, admin_id: int, admin_username: str) -> Order | None:
     """Обновляет адрес заказа."""
     order = await session.get(Order, order_id)
     if order:
         order.address_text = new_address
         order.address_lat = new_lat
         order.address_lon = new_lon
+        log_message = f"📍 Администратор @{admin_username} изменил адрес на: {new_address}"
+        session.add(OrderLog(order_id=order_id, message=log_message, admin_id=admin_id))
         await session.commit()
         return order
     return None
 
-async def update_order_rooms_and_price(session: AsyncSession, order_id: int, new_room_count: str, new_bathroom_count: str, new_total_price: float):
+async def update_order_rooms_and_price(session: AsyncSession, order_id: int, new_room_count: str, new_bathroom_count: str, new_total_price: float, admin_id: int, admin_username: str):
     """Обновляет количество комнат, санузлов и итоговую стоимость заказа."""
     order = await session.get(Order, order_id)
     if order:
         order.room_count = new_room_count
         order.bathroom_count = new_bathroom_count
         order.total_price = new_total_price
+        log_message = f"🏠 Администратор @{admin_username} изменил кол-во комнат на {new_room_count} и санузлов на {new_bathroom_count}. Новая цена: {new_total_price} ₽"
+        session.add(OrderLog(order_id=order_id, message=log_message, admin_id=admin_id))
         await session.commit()
         return order
     return None
@@ -402,7 +439,8 @@ async def get_executor_completed_orders(session: AsyncSession, executor_tg_id: i
         select(Order)
         .where(
             Order.executor_tg_id == executor_tg_id,
-            Order.status == OrderStatus.completed
+            Order.status == OrderStatus.completed,
+            Order.is_test == False
         )
         .order_by(Order.created_at.desc())
         .limit(limit)
@@ -433,11 +471,12 @@ def generate_referral_code(length: int = 8) -> str:
 # --- БЛОК: ФУНКЦИИ ДЛЯ РЕЙТИНГОВ ---
 
 async def save_order_rating(session: AsyncSession, order_id: int, rating: int, review_text: str) -> Order | None:
-    """Сохраняет оценку и текст отзыва для конкретного заказа."""
+    """Сохраняет оценку и текст отзыва для конкретного заказа и добавляет запись в лог."""
     order = await session.get(Order, order_id)
     if order:
         order.rating = rating
         order.review_text = review_text
+        session.add(OrderLog(order_id=order_id, message=f"⭐ Клиент поставил оценку {rating}/5"))
         await session.commit()
         return order
     return None
@@ -477,17 +516,30 @@ async def get_executor_orders_with_reviews(session: AsyncSession, executor_tg_id
     return result.scalars().all()
 # --- КОНЕЦ БЛОКА ---
 
-async def unassign_executor_from_order(session: AsyncSession, order_id: int) -> Order | None:
-    """Снимает исполнителя с заказа и возвращает заказ в статус 'new'."""
-    order = await session.get(Order, order_id)
-    if order:
-        order.executor_tg_id = None
-        order.status = OrderStatus.new
-        order.reminder_24h_sent = False # Сбрасываем флаги напоминаний
-        order.reminder_2h_sent = False
-        await session.commit()
-        return order
-    return None
+async def unassign_executor_from_order(session: AsyncSession, order_id: int) -> tuple[Order | None, int | None]:
+    """
+    Снимает исполнителя с заказа, добавляет его в список отказавшихся, возвращает заказ в статус 'new' и логирует действие.
+    Возвращает кортеж из обновленного заказа и ID предыдущего исполнителя.
+    """
+    order = await get_order_by_id(session, order_id)
+    if not order:
+        return None, None
+
+    previous_executor_id = order.executor_tg_id
+
+    # Если исполнитель был назначен, добавляем его в "отказники", чтобы не предлагать заказ снова
+    if previous_executor_id:
+        decline = DeclinedOrder(order_id=order_id, executor_tg_id=previous_executor_id)
+        session.add(decline)
+
+    order.executor_tg_id = None
+    order.status = OrderStatus.new
+    order.executor_payment = None
+    order.reminder_24h_sent = False # Сбрасываем флаги напоминаний
+    order.reminder_2h_sent = False
+    session.add(OrderLog(order_id=order_id, message="🔄 Исполнитель снят с заказа"))
+    await session.commit()
+    return order, previous_executor_id
 
 
 async def increment_and_get_declines(session: AsyncSession, telegram_id: int) -> User | None:
@@ -603,7 +655,8 @@ async def check_and_award_performance_bonus(session: AsyncSession, executor_tg_i
     stmt = select(func.count(Order.id)).where(
         Order.executor_tg_id == executor_tg_id,
         Order.status == OrderStatus.completed,
-        Order.rating.isnot(None)
+        Order.rating.isnot(None),
+        Order.is_test == False
     )
     result = await session.execute(stmt)
     rated_orders_count = result.scalar_one()
@@ -629,7 +682,7 @@ async def get_order_counts_by_status(session: AsyncSession) -> dict:
             func.count(case((Order.status.in_([OrderStatus.accepted, OrderStatus.on_the_way, OrderStatus.in_progress]), Order.id))).label("in_progress"),
             func.count(case((Order.status == OrderStatus.completed, Order.id))).label("completed"),
             func.count(case((Order.status == OrderStatus.cancelled, Order.id))).label("cancelled"),
-        )
+        ).where(Order.is_test == False)
     )
     result = await session.execute(stmt)
     counts = result.mappings().one()
@@ -638,13 +691,15 @@ async def get_order_counts_by_status(session: AsyncSession) -> dict:
 async def get_order_details_for_admin(session: AsyncSession, order_id: int) -> Order | None:
     """
     Возвращает детали заказа по его ID, подгружая связанные данные
-    о клиенте и исполнителе для панели администратора.
+    о клиенте, исполнителе и логах для панели администратора.
     """
     stmt = (
         select(Order)
         .options(
             selectinload(Order.items),  # Загружаем доп. услуги
-            selectinload(Order.executor).load_only(User.name, User.telegram_id, User.phone), # Загружаем только нужные поля Исполнителя
+            selectinload(Order.executor).load_only(User.name, User.telegram_id, User.phone, User.username),
+            # Загружаем и username
+            selectinload(Order.logs)
         )
         .where(Order.id == order_id)
     )
@@ -657,3 +712,262 @@ async def get_order_details_for_admin(session: AsyncSession, order_id: int) -> O
         order.client = client_result.scalar_one_or_none()
 
     return order
+
+async def get_all_executors(session: AsyncSession, supervisor_id: int | None = None) -> list[User]:
+    """
+    Возвращает список всех исполнителей.
+    Если указан supervisor_id, возвращает только исполнителей этого супервайзера.
+    """
+    stmt = (
+        select(User)
+        .where(User.role == UserRole.executor)
+    )
+    # Если передан ID супервайзера, добавляем фильтр
+    if supervisor_id:
+        stmt = stmt.where(User.supervisor_id == supervisor_id)
+
+    stmt = stmt.order_by(User.created_at.desc())
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+async def block_executor_by_admin(session: AsyncSession, executor_tg_id: int) -> User | None:
+    """Блокирует исполнителя (устанавливает статус blocked)."""
+    user = await get_user(session, executor_tg_id)
+    if user and user.role == UserRole.executor:
+        user.status = UserStatus.blocked
+        # Можно также установить user.blocked_until, если нужна временная блокировка
+        await session.commit()
+        return user
+    return None
+
+
+async def unblock_executor_by_admin(session: AsyncSession, executor_tg_id: int) -> User | None:
+    """Активирует исполнителя (устанавливает статус active)."""
+    user = await get_user(session, executor_tg_id)
+    if user and user.role == UserRole.executor:
+        user.status = UserStatus.active
+        user.blocked_until = None
+        await session.commit()
+        return user
+    return None
+
+async def update_executor_payment(session: AsyncSession, order_id: int, new_payment: float, admin_id: int, admin_username: str) -> Order | None:
+    """Обновляет сумму выплаты исполнителю и логирует действие."""
+    order = await session.get(Order, order_id)
+    if order and order.executor_tg_id:
+        order.executor_payment = new_payment
+        log_message = f"💰 Администратор @{admin_username} изменил выплату на {new_payment} ₽"
+        session.add(OrderLog(order_id=order_id, message=log_message, admin_id=admin_id))
+        await session.commit()
+        return order
+    return None
+
+async def get_orders_for_report_for_executor(session: AsyncSession, start_date: datetime.datetime, end_date: datetime.datetime, executor_tg_id: int) -> list[Order]:
+    """Возвращает все заказы конкретного исполнителя за указанный период для отчета."""
+    result = await session.execute(
+        select(Order)
+        .options(
+            selectinload(Order.client),
+            selectinload(Order.executor)
+        )
+        .where(
+            Order.executor_tg_id == executor_tg_id,
+            Order.created_at.between(start_date, end_date),
+            Order.is_test == False
+        )
+        .order_by(Order.created_at.desc())
+    )
+    return result.scalars().all()
+
+async def update_executor_priority(session: AsyncSession, executor_tg_id: int, new_priority: int) -> User | None:
+    """Обновляет приоритет исполнителя."""
+    user = await get_user(session, executor_tg_id)
+    if user and user.role == UserRole.executor:
+        user.priority = new_priority
+        await session.commit()
+        return user
+    return None
+
+async def get_executor_statistics(session: AsyncSession, executor_tg_id: int) -> dict:
+    """Собирает и возвращает статистику по конкретному исполнителю."""
+    stats = {
+        "completed_count": 0,
+        "cancelled_count": 0,
+        "in_progress_count": 0,
+        "total_earnings": 0.0,
+    }
+
+    # Считаем количество заказов по разным статусам
+    stmt_counts = (
+        select(
+            Order.status,
+            func.count(Order.id),
+            func.sum(Order.executor_payment)
+        )
+        .where(Order.executor_tg_id == executor_tg_id, Order.is_test == False)
+        .group_by(Order.status)
+    )
+    result_counts = await session.execute(stmt_counts)
+    status_stats = result_counts.all()
+
+    for status, count, total_payment in status_stats:
+        if status == OrderStatus.completed:
+            stats["completed_count"] = count
+            stats["total_earnings"] = total_payment or 0.0
+        elif status == OrderStatus.cancelled:
+            stats["cancelled_count"] = count
+        elif status in {OrderStatus.accepted, OrderStatus.on_the_way, OrderStatus.in_progress}:
+            # Суммируем все "активные" статусы в один счетчик
+            stats["in_progress_count"] += count
+
+    return stats
+
+async def update_user_role(session: AsyncSession, user_tg_id: int, new_role: UserRole) -> User | None:
+    """Обновляет роль пользователя."""
+    user = await get_user(session, user_tg_id)
+    if user:
+        user.role = new_role
+        await session.commit()
+        return user
+    return None
+
+
+async def assign_supervisor_to_executor(session: AsyncSession, executor_tg_id: int, supervisor_tg_id: int | None) -> User | None:
+    """Назначает или снимает супервайзера для исполнителя."""
+    executor = await get_user(session, executor_tg_id)
+    if executor and executor.role == UserRole.executor:
+        executor.supervisor_id = supervisor_tg_id
+        await session.commit()
+        return executor
+    return None
+
+
+async def get_all_supervisors(session: AsyncSession) -> list[User]:
+    """Возвращает список всех пользователей с ролью 'supervisor'."""
+    return await get_users_by_role(session, UserRole.supervisor)
+
+async def get_orders_by_status_for_supervisor(session: AsyncSession, supervisor_id: int, statuses: list[OrderStatus]) -> list[Order]:
+    """Возвращает список заказов с определенными статусами для супервайзера."""
+    # 1. Получаем список ID исполнителей, закрепленных за этим супервайзером
+    stmt_executors = select(User.telegram_id).where(User.supervisor_id == supervisor_id, User.role == UserRole.executor)
+    result_executors = await session.execute(stmt_executors)
+    executor_ids = result_executors.scalars().all()
+
+    if not executor_ids:
+        return []
+
+    # 2. Находим заказы с нужными статусами, которые назначены на этих исполнителей
+    stmt_orders = select(Order).where(
+        Order.status.in_(statuses),
+        Order.executor_tg_id.in_(executor_ids)
+    ).order_by(Order.created_at.desc())
+
+    result_orders = await session.execute(stmt_orders)
+    return result_orders.scalars().all()
+
+async def get_all_admins_and_supervisors(session: AsyncSession) -> list[User]:
+    """Возвращает список всех пользователей с ролями 'admin' и 'supervisor'."""
+    stmt = select(User).where(User.role.in_([UserRole.admin, UserRole.supervisor])).order_by(User.name)
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+async def get_orders_for_report(session: AsyncSession, start_date: datetime.datetime, end_date: datetime.datetime) -> list[Order]:
+    """Возвращает все заказы за указанный период для формирования отчета."""
+    result = await session.execute(
+        select(Order)
+        .options(
+            selectinload(Order.client),
+            selectinload(Order.executor)
+        )
+        .where(Order.created_at.between(start_date, end_date), Order.is_test == False)
+        .order_by(Order.created_at.desc())
+    )
+    return result.scalars().all()
+
+async def get_system_settings(session: AsyncSession) -> SystemSettings | None:
+    """Возвращает системные настройки (ожидается, что они хранятся с id=1)."""
+    result = await session.execute(select(SystemSettings).where(SystemSettings.id == 1))
+    return result.scalar_one_or_none()
+
+
+async def update_system_settings(session: AsyncSession, settings_data: dict) -> SystemSettings:
+    """Обновляет системные настройки или создает их, если они не существуют."""
+    settings = await get_system_settings(session)
+    if not settings:
+        settings = SystemSettings(id=1)
+        session.add(settings)
+
+    for key, value in settings_data.items():
+        setattr(settings, key, value)
+
+    await session.commit()
+    return settings
+
+async def get_general_statistics(session: AsyncSession) -> dict:
+    """Собирает и возвращает общую статистику по заказам."""
+    stats = {}
+    now = datetime.datetime.now()
+
+    # Заказы за сегодня
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    stmt_today = select(func.count(Order.id), func.sum(Order.total_price)).where(Order.created_at >= today_start, Order.is_test == False)
+    result_today = await session.execute(stmt_today)
+    stats['orders_today'], stats['revenue_today'] = result_today.one()
+
+    # Заказы за неделю
+    week_start = today_start - datetime.timedelta(days=now.weekday())
+    stmt_week = select(func.count(Order.id), func.sum(Order.total_price)).where(Order.created_at >= week_start, Order.is_test == False)
+    result_week = await session.execute(stmt_week)
+    stats['orders_week'], stats['revenue_week'] = result_week.one()
+
+    # Заказы за месяц
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    stmt_month = select(func.count(Order.id), func.sum(Order.total_price)).where(Order.created_at >= month_start, Order.is_test == False)
+    result_month = await session.execute(stmt_month)
+    stats['orders_month'], stats['revenue_month'] = result_month.one()
+
+    # Средний чек
+    stmt_avg = select(func.avg(Order.total_price)).where(Order.is_test == False)
+    result_avg = await session.execute(stmt_avg)
+    stats['avg_check'] = result_avg.scalar_one_or_none()
+
+    # Среднее время выполнения заказа
+    stmt_avg_completion = select(func.avg(Order.completed_at - Order.in_progress_at)).where(
+        Order.status == OrderStatus.completed,
+        Order.in_progress_at.isnot(None),
+        Order.completed_at.isnot(None)
+    )
+    result_avg_completion = await session.execute(stmt_avg_completion)
+    avg_completion_timedelta = result_avg_completion.scalar_one_or_none()
+    if avg_completion_timedelta:
+        total_seconds = avg_completion_timedelta.total_seconds()
+        hours = int(total_seconds // 3600)
+        minutes = int((total_seconds % 3600) // 60)
+        stats['avg_completion_time'] = f"{hours} ч {minutes} мин"
+    else:
+        stats['avg_completion_time'] = "Нет данных"
+
+
+    return stats
+
+async def get_top_executors(session: AsyncSession, limit: int = 5) -> list[User]:
+    """Возвращает список лучших исполнителей по рейтингу и количеству заказов."""
+    stmt = (
+        select(User)
+        .where(User.role == UserRole.executor, User.review_count > 0)
+        .order_by(User.average_rating.desc(), User.review_count.desc())
+        .limit(limit)
+    )
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+async def get_top_additional_services(session: AsyncSession, limit: int = 5) -> list:
+    """Возвращает список самых популярных дополнительных услуг."""
+    stmt = (
+        select(OrderItem.service_key, func.sum(OrderItem.quantity).label('total_quantity'))
+        .group_by(OrderItem.service_key)
+        .order_by(func.sum(OrderItem.quantity).desc())
+        .limit(limit)
+    )
+    result = await session.execute(stmt)
+    return result.all()

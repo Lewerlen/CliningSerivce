@@ -66,3 +66,20 @@ def calculate_total_cost(preliminary_cost: int, selected_services: dict) -> int:
             additional_cost += price * quantity
 
     return preliminary_cost + additional_cost
+
+def calculate_executor_payment(total_price: float, commission_type: str, commission_value: float) -> float:
+    """
+    Рассчитывает сумму выплаты исполнителю на основе настроек комиссии.
+    """
+    if commission_type == "percent":
+        # Если комиссия в процентах, вычитаем этот процент
+        payment = total_price * (1 - commission_value / 100)
+    elif commission_type == "fixed":
+        # Если комиссия фиксированная, просто вычитаем сумму
+        payment = total_price - commission_value
+    else:
+        # По умолчанию, если тип не задан, комиссия 0
+        payment = total_price
+
+    # Округляем до двух знаков после запятой и гарантируем, что выплата не будет отрицательной
+    return max(0, round(payment, 2))

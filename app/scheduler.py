@@ -6,6 +6,7 @@ from app.database.models import Order, OrderStatus, Ticket, TicketStatus, OrderO
 from app.common.texts import RUSSIAN_MONTHS_GENITIVE
 from app.handlers.client import TYUMEN_TZ
 from app.services.db_queries import get_order_by_id, get_matching_executors
+from app.config import Settings
 
 
 async def check_and_send_reminders(bots: dict, session_pool, admin_id: int):
@@ -135,7 +136,7 @@ async def check_and_auto_close_tickets(bot: Bot, session_pool):
         await session.commit()
 
 
-async def check_expired_offers(bots: dict, session_pool, admin_id: int):
+async def check_expired_offers(bots: dict, session_pool, admin_id: int, config: Settings):
     """
     Проверяет истекшие предложения по заказам и передает их следующим исполнителям.
     """
@@ -172,7 +173,7 @@ async def check_expired_offers(bots: dict, session_pool, admin_id: int):
                 next_executor = all_executors[current_executor_index + 1]
                 # Рекурсивно вызываем функцию, чтобы отправить предложение следующему
                 from app.handlers.client import offer_order_to_executor  # Локальный импорт
-                await offer_order_to_executor(session, bots, order, next_executor)
+                await offer_order_to_executor(session, bots, order, next_executor, config)
             else:
                 # Если следующий не найден (очередь закончилась)
                 await bots["admin"].send_message(

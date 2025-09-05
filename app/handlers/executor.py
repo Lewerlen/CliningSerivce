@@ -8,10 +8,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from typing import List
 from app.config import Settings
-from app.database.models import UserRole, OrderStatus, UserStatus, DeclinedOrder, MessageAuthor, TicketStatus, Ticket
+from app.database.models import UserRole, OrderStatus, UserStatus, DeclinedOrder, MessageAuthor
 from app.handlers.states import ExecutorRegistration, ChatStates, ExecutorSupportStates
-from app.keyboards.client_kb import ADDITIONAL_SERVICES
-from app.common.texts import STATUS_MAPPING
+from app.common.texts import ADDITIONAL_SERVICES, STATUS_MAPPING
+from app.services.price_calculator import calculate_executor_payment
 from app.services.db_queries import (
     get_user,
     register_executor,
@@ -27,9 +27,9 @@ from app.services.db_queries import (
     credit_referral_bonus, get_executor_orders_with_reviews,
     unassign_executor_from_order, increment_and_get_declines, reset_consecutive_declines, block_user_temporarily,
     unblock_user, add_declined_order, decline_active_offer, get_matching_executors, create_ticket, get_user_tickets,
-    get_ticket_by_id, add_message_to_ticket, update_ticket_status
+    get_ticket_by_id
 )
-
+from app.handlers.client import find_and_notify_executors
 from app.keyboards.executor_kb import (
     get_executor_main_keyboard, get_exit_chat_keyboard,
     get_phone_request_keyboard, get_reply_to_chat_keyboard,
@@ -101,8 +101,9 @@ async def register_phone_received(message: types.Message, session: AsyncSession,
         session=session,
         telegram_id=message.from_user.id,
         name=message.from_user.full_name,
+        username=message.from_user.username,
         phone=phone_number,
-        referred_by=referred_by # Передаем ID пригласившего
+        referred_by=referred_by  # Передаем ID пригласившего
     )
 
     await message.answer(
@@ -145,7 +146,7 @@ async def show_new_orders(message: types.Message, session: AsyncSession):
 
 
 @router.callback_query(F.data.startswith("executor_view_order:"))
-async def executor_view_order(callback: types.CallbackQuery, session: AsyncSession, state: FSMContext):
+async def executor_view_order(callback: types.CallbackQuery, session: AsyncSession, state: FSMContext, config: Settings):
     """Показывает детали заказа исполнителю."""
     order_id = int(callback.data.split(":")[1])
     order = await get_order_by_id(session, order_id)
@@ -171,6 +172,16 @@ async def executor_view_order(callback: types.CallbackQuery, session: AsyncSessi
             services_list.append(f"  - {service_name}")
     services_text = "\n".join(services_list) or "Нет"
 
+    # Внедряем новую переменную для финансового блока
+    financial_block = ""
+    if config.system.show_commission_to_executor:
+        financial_block = (
+            f"<b>Цена для клиента:</b> {order.total_price} ₽\n"
+            f"💰 <b>Ваша выплата:</b> {executor_payment} ₽"
+        )
+    else:
+        financial_block = f"💰 <b>Вознаграждение:</b> {executor_payment} ₽"
+
     order_details = (
         f"📝 <b>Детали заказа №{order.id}</b>\n\n"
         f"<b>Тип:</b> {order.cleaning_type}\n"
@@ -178,8 +189,7 @@ async def executor_view_order(callback: types.CallbackQuery, session: AsyncSessi
         f"<b>Адрес:</b> {order.address_text}\n"
         f"<b>Дата/время:</b> {formatted_date}, {order.selected_time}\n\n"
         f"<b>Доп. услуги:</b>\n{services_text}\n\n"
-        f"<b>Цена для клиента:</b> {order.total_price} ₽\n"
-        f"💰 <b>Ваша выплата:</b> {executor_payment} ₽"
+        f"{financial_block}"
     )
 
     await state.update_data({f"payment_{order_id}": executor_payment})
@@ -202,19 +212,20 @@ async def executor_accept_order(callback: types.CallbackQuery, session: AsyncSes
             await callback.message.edit_text("❌ Ошибка: заказ не найден.")
             await callback.answer()
             return
-        payment = round(order_for_payment.total_price * 0.85)
+        payment = calculate_executor_payment(
+            total_price=order_for_payment.total_price,
+            commission_type=config.system.commission_type,
+            commission_value=config.system.commission_value
+        )
 
     order = await assign_executor_to_order(session, order_id, callback.from_user.id, payment)
 
     if order:
-        # Сбрасываем счетчик отказов при успешном принятии заказа
         await reset_consecutive_declines(session, callback.from_user.id)
-
         await callback.message.edit_text(
             f"✅ Вы приняли заказ №{order.id}. Он перемещен в раздел 'Мои заказы'.\n\n"
             f"Не забудьте изменить статус на '🚀 В пути', когда отправитесь к клиенту."
         )
-
         try:
             await bots["client"].send_message(
                 order.client_tg_id,
@@ -282,10 +293,10 @@ async def executor_decline_order(callback: types.CallbackQuery, session: AsyncSe
             next_executor = executor
             break
 
-    # Если нашли, отправляем ему предложение
+        # Если нашли, отправляем ему предложение
     if next_executor:
         from app.handlers.client import offer_order_to_executor  # Локальный импорт
-        await offer_order_to_executor(session, bots, order, next_executor)
+        await offer_order_to_executor(session, bots, order, next_executor, config)
     else:
         # Если исполнители кончились
         await bots["admin"].send_message(
@@ -330,8 +341,9 @@ async def executor_view_my_order(callback: types.CallbackQuery, session: AsyncSe
 
     services_text = "\n".join([f"  - {ADDITIONAL_SERVICES[item.service_key]}" for item in order.items]) or "Нет"
 
+    test_label = " (ТЕСТ)" if order.is_test else ""
     order_details = (
-        f"📝 <b>Детали заказа №{order.id}</b>\n\n"
+        f"📝 <b>Детали заказа №{order.id}{test_label}</b>\n\n"
         f"<b>Статус:</b> {STATUS_MAPPING.get(order.status, 'Неизвестен')}\n"
         f"<b>Клиент:</b> {order.order_name}\n"
         f"<b>Адрес:</b> {order.address_text}\n"
@@ -378,6 +390,10 @@ async def executor_status_in_progress(callback: types.CallbackQuery, session: As
     order = await update_order_status(session, order_id, OrderStatus.in_progress)
 
     if order:
+        # Устанавливаем время начала уборки
+        order.in_progress_at = datetime.datetime.now()
+        await session.commit()
+
         await callback.message.edit_text(
             f"✅ Статус заказа №{order.id} изменен на 'В работе'.\n\n"
             f"После окончания уборки, пожалуйста, загрузите фото 'после' и нажмите '✅ Завершить'."
@@ -502,6 +518,10 @@ async def executor_complete_order(callback: types.CallbackQuery, session: AsyncS
     updated_order = await update_order_status(session, order_id, OrderStatus.completed)
 
     if updated_order:
+        # Устанавливаем время завершения уборки
+        updated_order.completed_at = datetime.datetime.now()
+        await session.commit()
+
         await callback.message.edit_text(f"🎉 Заказ №{order_id} успешно завершен!")
 
         # --- НОВЫЙ БЛОК: Проверка и начисление реферального бонуса ---
@@ -816,8 +836,8 @@ async def view_order_photos(callback: types.CallbackQuery, session: AsyncSession
 # --- БЛОК: ЧАТ С КЛИЕНТОМ ---
 
 @router.callback_query(F.data.startswith("start_chat:"))
-async def start_chat_with_client(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession):
-    """Начинает чат с клиентом по конкретному заказу."""
+async def start_chat_with_partner(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession, config: Settings):
+    """Начинает чат с клиентом или администратором в зависимости от контекста."""
     order_id = int(callback.data.split(":")[1])
     order = await get_order_by_id(session, order_id)
 
@@ -825,15 +845,35 @@ async def start_chat_with_client(callback: types.CallbackQuery, state: FSMContex
         await callback.answer("Не удалось найти заказ.", show_alert=True)
         return
 
-    await state.set_state(ChatStates.in_chat)
-    await state.update_data(chat_partner_id=order.client_tg_id, order_id=order.id)
+    original_message_text = callback.message.text or callback.message.caption or ""
+    partner_id = None
+    partner_role = None
+    welcome_text = ""
 
-    await callback.message.answer(
-        f"Вы вошли в чат с клиентом по заказу №{order.id}.\n"
-        "Все сообщения, которые вы сюда отправите, будут пересланы ему. "
-        "Чтобы выйти, нажмите кнопку ниже.",
-        reply_markup=get_exit_chat_keyboard()
+    # Если в сообщении есть упоминание администратора/поддержки, это ответ админу
+    if "[Администратор" in original_message_text or "[Поддержка" in original_message_text:
+        partner_id = config.admin_id
+        partner_role = "admin"
+        welcome_text = f"Вы вошли в чат с администратором по заказу №{order.id}.\n" \
+                       "Все сообщения будут пересланы. Для выхода нажмите кнопку."
+    # В противном случае, это чат с клиентом
+    elif order.client_tg_id:
+        partner_id = order.client_tg_id
+        partner_role = "client"
+        welcome_text = f"Вы вошли в чат с клиентом по заказу №{order.id}.\n" \
+                       "Все сообщения, которые вы сюда отправите, будут пересланы ему. " \
+                       "Чтобы выйти, нажмите кнопку ниже."
+    else:
+        await callback.answer("Не удалось определить получателя чата.", show_alert=True)
+        return
+
+    await state.set_state(ChatStates.in_chat)
+    await state.update_data(
+        chat_partner_id=partner_id,
+        partner_role=partner_role,
+        order_id=order.id
     )
+    await callback.message.answer(welcome_text, reply_markup=get_exit_chat_keyboard())
     await callback.answer()
 
 
@@ -848,43 +888,49 @@ async def exit_chat_executor(message: types.Message, state: FSMContext):
 
 
 @router.message(ChatStates.in_chat)
-async def forward_message_to_client(message: types.Message, state: FSMContext, bots: dict):
-    """Пересылает сообщение от исполнителя клиенту."""
+async def forward_message_from_executor(message: types.Message, state: FSMContext, bots: dict):
+    """Пересылает сообщение от исполнителя клиенту или админу."""
     user_data = await state.get_data()
     partner_id = user_data.get("chat_partner_id")
     order_id = user_data.get("order_id")
+    partner_role = user_data.get("partner_role") # Получаем роль из состояния
 
-    if not partner_id:
+    if not all([partner_id, order_id, partner_role]):
+        await message.answer("Ошибка чата. Попробуйте начать заново.")
         return
 
-    # Если пользователь пытается отправить альбом, вежливо просим этого не делать
+    # Динамически выбираем нужного бота для отправки
+    target_bot = bots.get(partner_role)
+    if not target_bot:
+        await message.answer(f"Ошибка конфигурации: бот для роли '{partner_role}' не найден.")
+        return
+
     if message.media_group_id:
         await message.answer("Пожалуйста, отправляйте фотографии по одной за раз.")
         return
 
-    client_bot = bots.get("client")
     prefix = f"💬 <b>[Исполнитель | Заказ №{order_id}]:</b>\n"
-    reply_keyboard = get_reply_to_chat_keyboard(order_id)
+    # Если сообщение адресовано админу, кнопка "Ответить" ему не нужна
+    reply_keyboard = get_reply_to_chat_keyboard(order_id) if partner_role != "admin" else None
 
     try:
         if message.text:
-            await client_bot.send_message(partner_id, f"{prefix}{message.text}", reply_markup=reply_keyboard)
+            await target_bot.send_message(partner_id, f"{prefix}{message.text}", reply_markup=reply_keyboard)
         elif message.photo:
             photo_file = await message.bot.get_file(message.photo[-1].file_id)
             photo_bytes_io = await message.bot.download_file(photo_file.file_path)
             photo_to_send = BufferedInputFile(photo_bytes_io.read(), filename="photo.jpg")
 
-            await client_bot.send_photo(
+            await target_bot.send_photo(
                 chat_id=partner_id,
                 photo=photo_to_send,
                 caption=f"{prefix}{message.caption or ''}",
                 reply_markup=reply_keyboard
             )
-
         await message.answer("✅ Ваше сообщение отправлено.")
 
     except Exception as e:
-        logging.error(f"Ошибка пересылки сообщения клиенту {partner_id}: {e}")
+        logging.error(f"Ошибка пересылки сообщения к {partner_role} {partner_id}: {e}")
         await message.answer("Не удалось доставить сообщение. Попробуйте позже.")
 
 # --- КОНЕЦ БЛОКА ---
@@ -943,17 +989,20 @@ async def executor_decline_changes(callback: types.CallbackQuery, session: Async
         except Exception as e:
             logging.error(f"Не удалось уведомить клиента об отказе исполнителя по заказу {order_id}: {e}")
 
-        # Уведомляем админа
-        await bots["admin"].send_message(
-            config.admin_id,
-            f"❗️ Исполнитель @{callback.from_user.username or callback.from_user.id} отказался от заказа №{order_id} после внесения изменений. "
-            "Заказ возвращен в пул новых."
-        )
+            # Уведомляем админа
+            await bots["admin"].send_message(
+                config.admin_id,
+                f"❗️ Исполнитель @{callback.from_user.username or callback.from_user.id} отказался от заказа №{order_id} после внесения изменений. "
+                "Заказ возвращен в пул новых."
+            )
 
-    else:
-        await callback.message.edit_text("❌ Не удалось обновить заказ.")
+            # Запускаем повторный поиск исполнителя
+            await find_and_notify_executors(session, order_id, bots["executor"], config)
 
-    await callback.answer()
+        else:
+            await callback.message.edit_text("❌ Не удалось обновить заказ.")
+
+        await callback.answer()
 
 # --- БЛОК: СИСТЕМА ПОДДЕРЖКИ ДЛЯ ИСПОЛНИТЕЛЯ ---
 

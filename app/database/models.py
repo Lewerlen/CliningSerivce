@@ -11,6 +11,7 @@ class UserRole(enum.Enum):
     client = "client"
     executor = "executor"
     admin = "admin"
+    supervisor = "supervisor"
 
 class UserStatus(enum.Enum):
     active = "active"
@@ -20,9 +21,11 @@ class User(Base):
     __tablename__ = 'users'
 
     id = Column(Integer, primary_key=True)
-    telegram_id = Column(BigInteger, unique=True, nullable=False) # [cite: 283]
-    role = Column(Enum(UserRole), default=UserRole.client, nullable=False) # [cite: 283]
-    name = Column(String) # [cite: 283]
+    telegram_id = Column(BigInteger, unique=True, nullable=False)
+    username = Column(String, nullable=True)  # Добавили это поле
+    role = Column(Enum(UserRole), default=UserRole.client, nullable=False)
+    name = Column(String)
+    supervisor_id = Column(BigInteger, ForeignKey('users.telegram_id'), nullable=True)
     phone = Column(String) # [cite: 283]
     rating = Column(Float, default=0.0) # [cite: 283]
     status = Column(Enum(UserStatus), default=UserStatus.active, nullable=False) # [cite: 283]
@@ -67,7 +70,7 @@ class Order(Base):
     __tablename__ = 'orders'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    client_tg_id = Column(BigInteger, nullable=False)
+    client_tg_id = Column(BigInteger, ForeignKey('users.telegram_id'), nullable=False)
     executor_tg_id = Column(BigInteger, ForeignKey('users.telegram_id'), nullable=True) # ID исполнителя
     status = Column(Enum(OrderStatus), default=OrderStatus.new, nullable=False)
     executor_payment = Column(Float, nullable=True) # Сумма выплаты исполнителю
@@ -104,10 +107,28 @@ class Order(Base):
     # Связь с таблицей order_items
     items = relationship("OrderItem", back_populates="order")
     executor = relationship("User", foreign_keys=[executor_tg_id])
+    client = relationship("User", foreign_keys=[client_tg_id])
 
     rating = Column(Integer, nullable=True)
     review_text = Column(String, nullable=True)
 
+    # Время начала и завершения уборки
+    in_progress_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+
+    logs = relationship("OrderLog", back_populates="order", cascade="all, delete-orphan")
+
+
+class OrderLog(Base):
+    __tablename__ = 'order_logs'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    order_id = Column(Integer, ForeignKey('orders.id'), nullable=False)
+    timestamp = Column(DateTime, default=datetime.datetime.now, nullable=False)
+    message = Column(String, nullable=False)  # Текст лога, например "Заказ создан клиентом"
+    admin_id = Column(BigInteger, nullable=True) # ID админа, совершившего действие
+
+    order = relationship("Order", back_populates="logs")
 
 
 class OrderItem(Base):
@@ -199,3 +220,18 @@ class OrderOffer(Base):
 
     order = relationship("Order")
     executor = relationship("User")
+
+class SystemSettings(Base):
+    __tablename__ = 'system_settings'
+
+    id = Column(Integer, primary_key=True, default=1)
+    commission_type = Column(String, default="percent")
+    commission_value = Column(Float, default=15.0)
+    test_mode_enabled = Column(Boolean, default=False)
+    show_commission_to_executor = Column(Boolean, default=True, nullable=False)
+    # Мы будем хранить тарифы в виде JSON для гибкости
+    tariffs = Column(String, default='{}')
+    additional_services = Column(String, default='{}')
+
+# Добавляем поле is_test в модель Order
+Order.is_test = Column(Boolean, default=False, nullable=False)

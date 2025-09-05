@@ -41,8 +41,40 @@ class ExecutorRegistration(StatesGroup):
 
 class ChatStates(StatesGroup):
     in_chat = State()
+    admin_chat = State()
 
 class ExecutorSupportStates(StatesGroup):
     creating_ticket_message = State()
     waiting_for_ticket_photo = State()
     replying_to_ticket = State()
+
+class AdminOrderStates(StatesGroup):
+    assigning_executor = State()
+    editing_order = State()
+    editing_additional_services = State()
+    editing_date = State()
+    editing_time = State()
+    editing_address = State()
+    confirming_edited_address = State()
+    editing_room_count = State()
+    editing_bathroom_count = State()
+    editing_executor_payment = State()
+
+class AdminExecutorStates(StatesGroup):
+    viewing_executors = State()
+    editing_priority = State()
+    managing_access = State()
+    choosing_supervisor = State()
+
+
+class AdminSettingsStates(StatesGroup):
+    choosing_setting = State()
+    choosing_tariff_type = State()
+    editing_tariff = State()
+    choosing_additional_service = State()
+    editing_additional_service_price = State()
+    editing_commission_type = State()
+    editing_commission_value = State()
+    managing_administration = State()
+    adding_admin_id = State()
+    adding_supervisor_id = State()
